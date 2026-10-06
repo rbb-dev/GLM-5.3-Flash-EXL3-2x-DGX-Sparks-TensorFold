@@ -1,0 +1,99 @@
+# Live draft counts by source and position, for mgllm's dashboard (the RATE box's drafter view) and engine-top.
+# TensorFold counts drafts only as totals of finished requests (tensorfold:mtp_drafted_total, mtp_accepted_total,
+# tensorfold_health:rounds_total). With --parallel, every decode round now also counts, for each stream, where its
+# draft came from (dflash2, copy, none) and, for each draft position from 1, whether the draft reached it and whether
+# that token was kept: /health's "drafts", and on /metrics tensorfold_health:draft_rounds_total{source},
+# draft_position_drafted_total{source,position} and draft_position_accepted_total{source,position}, live since start.
+# Counting only (MultiDecoder._count_drafts, called in _round after the accept loop, a few integer additions per
+# stream per round): drafts, verification and replies are unchanged. mgllm, 2026-10-06.
+# Tests: tests/test_9001_draft_positions.py (CPU).
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 775b2a5..2753604 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -512,6 +512,9 @@ class MultiDecoder:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
++        # live since start, for /health and /metrics: a stream's decode rounds by where its draft came from (dflash2,
++        # copy, none), and for each draft position how many of those rounds drafted it and how many kept it
++        self.draft_counts: dict[str, dict] = {}
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+             from .dflash2_multi import MultiDrafter
+@@ -603,6 +606,8 @@ class MultiDecoder:
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
++                "drafts": {k: {"rounds": c["rounds"], "drafted": list(c["drafted"]), "accepted": list(c["accepted"])}
++                           for k, c in list(self.draft_counts.items())},
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -2139,6 +2144,8 @@ class MultiDecoder:
+                 l.copies.extend(new)
+             ndrafts = len(seg.tokens) - 1
+             s.counted(len(seg.tokens))                     # Stream.take counts the accepted drafts
++            self._count_drafts("copy" if was_copy else "dflash2" if ndrafts and l.dflash else
++                               "draft" if ndrafts else "none", ndrafts, keep - 1)
+             if was_copy:
+                 l.copy_rounds += 1
+                 l.copy_drafted += ndrafts
+@@ -2155,6 +2162,20 @@ class MultiDecoder:
+             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
+                      sum(len(g.tokens) - 1 for g in segments))
+ 
++    def _count_drafts(self, source: str, drafted: int, accepted: int) -> None:
++        """One stream's round: its draft's source, then positions 1..``drafted`` drafted and 1..``accepted`` kept (a
++        kept draft token's earlier positions were all kept). Counts only; drafts and replies are unchanged."""
++
++        c = self.draft_counts.get(source)
++        if c is None:
++            c = self.draft_counts[source] = {"rounds": 0, "drafted": [], "accepted": []}
++        c["rounds"] += 1
++        for row, n in ((c["drafted"], drafted), (c["accepted"], accepted)):
++            if len(row) < n:
++                row.extend([0] * (n - len(row)))
++            for p in range(n):
++                row[p] += 1
++
+     def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
+         """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
+         round's rows allocated across them by expected tokens per ms (``multi_tune.allocate``). The picks are each
+diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
+index c96a9a8..e143382 100644
+--- tensorfold/server/metrics.py
++++ tensorfold/server/metrics.py
+@@ -236,6 +236,31 @@ def _health(lines: list[str], app: Any) -> None:
+             else:
+                 name, kind = f"spill_{key}_total", "counter"
+             _family(lines, name, kind, f"Spill tier: /health's spill.{key}.", [f"{HEALTH}{name} {_num(value)}"], HEALTH)
++    _drafts(lines, body.get("drafts"))
++
++
++def _drafts(lines: list[str], drafts: Any) -> None:
++    """The concurrent engine's live draft counts (/health's drafts): each stream's decode rounds by the source of its
++    draft, and per draft position the rounds that drafted it and the rounds that kept it (positions from 1)."""
++
++    if not isinstance(drafts, dict) or not drafts:
++        return
++    rounds, drafted, accepted = [], [], []
++    for source in sorted(drafts):
++        d = drafts[source] if isinstance(drafts[source], dict) else {}
++        made, kept = list(d.get("drafted") or ()), list(d.get("accepted") or ())
++        rounds.append(f'{HEALTH}draft_rounds_total{{source="{source}"}} {_num(d.get("rounds", 0))}')
++        for p, n in enumerate(made, 1):
++            label = f'source="{source}",position="{p}"'
++            drafted.append(f"{HEALTH}draft_position_drafted_total{{{label}}} {_num(n)}")
++            accepted.append(f"{HEALTH}draft_position_accepted_total{{{label}}} {_num(kept[p - 1] if p <= len(kept) else 0)}")
++    _family(lines, "draft_rounds_total", "counter",
++            "Decode rounds of each stream since start, by its draft's source (dflash2, copy, none).", rounds, HEALTH)
++    if drafted:
++        _family(lines, "draft_position_drafted_total", "counter",
++                "Rounds since start whose draft reached this position.", drafted, HEALTH)
++        _family(lines, "draft_position_accepted_total", "counter",
++                "Rounds since start whose draft token at this position was kept.", accepted, HEALTH)
+ 
+ 
+ def _read(read, default):
