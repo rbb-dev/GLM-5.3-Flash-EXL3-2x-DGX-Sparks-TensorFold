@@ -12,6 +12,7 @@ NOTICE asks, this file states what the fork adds.
 | `9001-mgllm-draft-positions` | Live draft counts by source (dflash2, copy, none) and by draft position on `/health` and `/metrics` | this fork | Counting only: drafts, verification and replies are unchanged. Test: `tests/test_9001_draft_positions.py` |
 | `9002-mgllm-anthropic-fixes` | Fixes to the recipe's Anthropic Messages API (its `0084`): a `ping` event while a tool call is held, a 400 from `count_tokens` for a request it cannot prepare (503 at capacity), a tool result's pictures kept inside it in order, and request bodies up to the chat route's limit | this fork | Test: `tests/test_9002_stream_and_count.py` |
 | `9003-mgllm-decode-speed` | Each finished request's decode time and decode rate as histograms on `/metrics` | backport of TensorFold c9259c3, plus a rate histogram | Metrics only. Test: `tests/test_9003_decode_speed.py` |
+| `9004-mgllm-turn-records` | Each finished reply's exact tokens, thinking included, recorded on the kept prompt state it ends on, so the spill tier (the recipe's 0088) saves, reads back and evicts them with that state | this fork | Changes nothing a request is served (9005 uses the records). Needs `--parallel` above 1. Tests: `tests/test_9004_*.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
@@ -45,7 +46,7 @@ patches on top.
 
 The tests in `tests/` are pytest unit tests for this fork's patches. They run on the CPU against a TensorFold v0.6.0
 source tree with all patches applied, with that tree's `src/` on `PYTHONPATH`. They need `pytest`, `prometheus_client`
-and TensorFold's own Python dependencies (a CPU build of `torch` is enough).
+and TensorFold's own Python dependencies (a CPU build of `torch` is enough). The 9004 and 9005 tests also read GLM-5.3-Flash's `tokenizer.json`, `chat_template.jinja` and `tokenizer_config.json` from the folder `TF_GLM_TEST_MODEL_DIR` names (a checkpoint snapshot); without it they are skipped.
 
 ## License
 

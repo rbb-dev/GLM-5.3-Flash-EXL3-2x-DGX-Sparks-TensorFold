@@ -1,0 +1,991 @@
+# Turn records for GLM-5.3-Flash on the parallel engine (--parallel above 1), kept inside the spill tier (0088). A
+# record is the exact tokens the engine read and wrote for a conversation's turn, thinking included, so that a later
+# request from a client that drops the thinking can be mapped back onto them (9005). It is two plain fields of the
+# kept prompt state the reply ends on (decode.Snapshot): turn_key, the label and checks a lookup needs, which the tier's
+# scan keeps in RAM, and turn, the body, kept only in the state's file. The tier writes, reads back and evicts a record
+# with its state: there is no store, folder or eviction of its own. A turn's label names it by what a client sends back
+# of it: one sha256 pass over the request's render, fed each span as length-prefixed raw bytes, reasoning left out,
+# under a namespace of the tokenizer, chat template, clear_thinking, checkpoint and TF_GLM_LABEL_SALT (optional). At the
+# end of an eligible reply, on the request thread and before the closing event, the reply alone continues the request's
+# label pass, and the record lands on the request's own kept state unless it would replace another branch's record.
+# The decoder holds a just-finished state back from early writes until its record lands (never from an eviction or the
+# shutdown flush), and a new state takes the record of the state it resumed from when its prompt continues that
+# record's tokens. No record for a reply the model did not end, thinking off, pictures, draft:false, ignore_eos,
+# chat_template_kwargs beyond the allowed ones, several engine runs, a tool call before </think>, a call the server
+# closed or cut, reasoning over 65,536 tokens or a reasoning loop: each a cache miss later, never an error. Rank 0 only;
+# nothing here can fail a reply or raise into the engine; alone it changes nothing a request is served.
+# mgllm, 2026-10-07.
+# Tests: tests/test_9004_labels.py, tests/test_9004_records.py, tests/test_9004_kept_records.py (CPU; the first two
+# need TF_GLM_TEST_MODEL_DIR).
+
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+index b69b622..a0c834f 100644
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -98,6 +98,12 @@ class Health:
+                     extra = {}
+                 body["streams"].update(extra.pop("streams", {}))
+                 body.update(extra)
++        extra = getattr(app, "health_extra", None)          # a family's own app-level counts (GLM: turn records, 9004)
++        if callable(extra):
++            try:
++                body.update(extra())
++            except Exception:                         # noqa: BLE001  (never fail /health)
++                pass
+         window = getattr(app, "effective_context_window", None)
+         if window:
+             body["context_length"] = int(window)
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 0217b27..a360b23 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -56,6 +56,9 @@ class PreparedRequest:
+     vision: Any = None
+     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
+     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
++    text: str | None = None              # 9004: the rendered chat text the prompt encodes (plain chats only)
++    template_kwargs: dict[str, Any] | None = None   # 9004: the template's kwargs for that render
++    resume: Any = None                   # 9004/9005: the family's label-path view of this request
+ 
+ 
+ def _native_context(model_dir: Path) -> int:
+@@ -210,6 +213,7 @@ class App:
+             if not hasattr(self, "_probability_decoder"):
+                 self._probability_decoder = TokenBytes(self.tok)
+         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
++        plain = None                         # 9004: the chat text when rendered from the messages as sent
+         if chat:
+             if not isinstance(body.get("messages"), list):
+                 raise RequestError("messages must be a list")
+@@ -236,6 +240,7 @@ class App:
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             else:
+                 text = render(body["messages"])
++                plain = text
+             prompt = self.tok.encode(text, add_special_tokens=False).ids
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+@@ -248,7 +253,8 @@ class App:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+-                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
++                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
++                               text=plain, template_kwargs=kwargs if chat else None)
+ 
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
+@@ -641,7 +647,9 @@ class App:
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+-                "stats": stats}
++                "stats": stats,
++                # 9004, for the family's hooks only (never sent): the reply's ids and how it ended
++                "out": list(out), "ended": ended, "closed_call": bool(closing[0])}
+ 
+     def _turns(self) -> Turns:
+         """The engine's turns (one request at a time, background ones last), made on first use."""
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 4e7d1bd..97f0e58 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -3,12 +3,15 @@
+ from __future__ import annotations
+ 
+ import os
++from collections import Counter
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.server.errors import CONTEXT_LIMIT
++from tensorfold.families.glm5_next.cuda import labels, turn_records
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
++from tensorfold.families.glm5_next.cuda.turn_records import View
+ from tensorfold.families.glm5_next.prompts import agent_history, effort_tail_enabled, effort_to_tail, thinking_off
+ 
+ 
+@@ -35,6 +38,16 @@ class ThinkingOffTemplate:
+             text = effort_to_tail(text, bool(enable_thinking))
+         return text if enable_thinking else thinking_off(text)
+ 
++    def render_marked(self, messages, *, tools, extra=None, marks) -> tuple[str, list]:
++        """9004: a thinking request's render with ``marks`` (``labels.Marks``) placed after the history is made
++        renderable and before the template runs, and the messages they index (``labels.analyse`` takes both)."""
++
++        if self.kept is not None:
++            messages = self.kept.restore(messages)
++        extra = {"clear_thinking": self.clear_thinking, **(extra or {})}
++        history = agent_history(messages)
++        return self.inner.render(marks.apply(history), tools=tools, enable_thinking=True, extra=extra), history
++
+ 
+ # the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+ # (Glm5NextProcessor's layout), and every text-only prompt renders as before. A part's ``tf_mark`` (server.prompts'
+@@ -61,6 +74,8 @@ class GlmApp(App):
+     reads_ignore_eos = True             # ``run`` hands it to the engine's request
+     # without --vision, a tool result's pictures render as the template's own reminder (issue #28): a user's are refused
+     tool_media_reminders = True
++    label_ns = None                     # 9004: the turn records' namespace when they are on (the parallel engine)
++    record_counts = None
+ 
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+@@ -71,6 +86,37 @@ class GlmApp(App):
+             raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
+         effort_tail_enabled()       # a typo fails at load, not at the first request
+         self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
++        self.record_counts = Counter()
++        self.label_ns = self._label_namespace(Path(model_dir), clear == "1")
++
++    def _label_namespace(self, model: Path, clear: bool) -> bytes | None:
++        """9004: the namespace turn records live in, when this engine keeps prompt states across requests (the
++        parallel path); None turns records off. An error here only turns them off, never the engine."""
++
++        if getattr(self.engine, "multi", None) is None:
++            return None
++        try:
++            template_sha = labels.file_sha256(model / "chat_template.jinja") + ("+media" if self.vision else "")
++            ns = labels.namespace(labels.file_sha256(model / "tokenizer.json"), template_sha, clear,
++                                  labels.content_id(model), os.environ.get("TF_GLM_LABEL_SALT", "").strip())
++        except Exception as exc:                 # noqa: BLE001
++            print(f"[tensorfold] turn records: off ({exc!r})", flush=True)
++            return None
++        print("[tensorfold] turn records: on, kept with the prompt states they continue", flush=True)
++        return ns
++
++    def prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
++        """``App.prepare``, then (9004) the request seen through one marked render: its labels, and the label pass a
++        record of its reply continues. Read-only; any error leaves today's request unchanged."""
++
++        prepared = super().prepare(body, chat)
++        if chat and self.label_ns is not None:
++            try:
++                prepared.resume = turn_records.view(self.template, body, prepared, self.label_ns,
++                                                    self.template.clear_thinking)
++            except Exception as exc:             # noqa: BLE001
++                prepared.resume = f"error: {exc!r}"
++        return prepared
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+@@ -100,9 +146,89 @@ class GlmApp(App):
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+-        result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        if prepared is None:
++            prepared = self.prepare(body, chat)
++        holder: dict[str, Any] | None = {} if chat and self.label_ns is not None else None
++        self.engine.request.turn = holder        # 9004: the engine names the request's own kept state in it
++        try:
++            result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        except BaseException:
++            self._release(holder)
++            raise
++        finally:
++            self.engine.request.turn = None
++        if holder is not None:                   # before run returns: before the reply's closing event
++            result["stats"] = {**(result.get("stats") or {}), "resume": self._record(body, prepared, result, holder)}
+         kept = getattr(self.template, "kept", None)
+         if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
+             # the calls' reasoning, for a client that will not send it back
+             kept.remember(body.get("messages"), result["calls"], result.get("reasoning"))
+         return result
++
++    def _release(self, holder: dict[str, Any] | None) -> None:
++        multi = getattr(self.engine, "multi", None)
++        if holder and holder.get("kid") is not None and multi is not None:
++            try:
++                multi.release_due(holder["kid"])
++            except Exception:                    # noqa: BLE001
++                pass
++
++    def _record(self, body: dict[str, Any], prepared: PreparedRequest, result: dict[str, Any],
++                holder: dict[str, Any]) -> dict[str, Any]:
++        """9004: an eligible reply's record, set on the request's own kept state (named by the engine in ``holder``);
++        the state's hold is released whatever happens. An error loses this record only, never the reply."""
++
++        v = prepared.resume
++        info: dict[str, Any] = {"path": "record" if isinstance(v, View) and v.hit is not None else "render"}
++        why: str | None = None
++        try:
++            out = result.get("out") or []
++            why = turn_records.eligibility(
++                chat=True, thinking=prepared.thinking, draft=body.get("draft", True) is not False,
++                ignore_eos=prepared.ignore_eos, kwargs=body.get("chat_template_kwargs"),
++                pictures=prepared.vision is not None, result=result, out=out,
++                think_close=self.tok.token_to_id("</think>"), call_open=self.tok.token_to_id("<tool_call>"),
++                runs=int(holder.get("runs") or 0))
++            if why is None and not isinstance(v, View):
++                why = v if isinstance(v, str) else "no view"
++            state = None
++            if why is None:
++                kid = holder.get("kid")
++                multi = getattr(self.engine, "multi", None)
++                state = next((c for c in list(getattr(multi, "kept", None) or ()) if c.kid == kid), None) \
++                    if kid is not None else None
++                why = None if state is not None else "no own state" if kid is None else "state gone"
++            if why is None:
++                T = list(prepared.prompt) + list(out[:-1])
++                if not turn_records.continues(state, T):
++                    why = "another branch's record"
++                else:
++                    made = turn_records.make_record(self.template, v, result, prompt=prepared.prompt, out=out,
++                                                    tools=prepared.tools, kwargs=prepared.template_kwargs,
++                                                    base=len(state.ids))
++                    if isinstance(made, str):
++                        why = made
++                    else:
++                        key, record, tail = made
++                        state._turn_tail, state.turn, state.turn_key = tail, record, key
++                        info["written"] = True
++                        self.record_counts["written"] += 1
++        except Exception as exc:                 # noqa: BLE001  (the reply stands; only its record is lost)
++            why = f"error: {exc!r}"
++        finally:
++            self._release(holder)
++        if why:
++            info["not_written"] = "error" if why.startswith("error") else why    # never an exception's text
++            self.record_counts["not written: " + why.split(":")[0]] += 1
++        return info
++
++    def health_extra(self) -> dict[str, Any]:
++        """9004: turn records on /health: on or off, kept states carrying one, holds waiting, counts."""
++
++        if self.label_ns is None:
++            return {}
++        multi = getattr(self.engine, "multi", None)
++        kept = list(getattr(multi, "kept", None) or ())
++        return {"turns": {"on": True, "kept_with_record": sum(1 for c in kept if getattr(c, "turn_key", None)),
++                          "due": len(getattr(multi, "record_due", None) or ()),
++                          "counts": dict(self.record_counts or {})}}
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 2e4b01e..cbbf67a 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -372,6 +372,13 @@ class Snapshot:
+     # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
+     # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
+     head: torch.Tensor | None = None
++    # 9004, rank 0 only: the turn record this state carries (``turn_records``): the key the lookup indexes, a plain
++    # string the spill tier keeps in RAM, and the body, a one-element list the tier saves but does not keep in RAM;
++    # ``_turn_tail`` caches the body's tokens and is never saved. Declared here so setting them never changes the
++    # object's shape while the tier encodes it.
++    turn_key: str | None = None
++    turn: list | None = None
++    _turn_tail: list | None = None
+ 
+ 
+ def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9ff932d..2e922d1 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1478,9 +1478,12 @@ class GlmEngine:
+         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
+             if vision is not None and self.vision is None:
+                 raise ValueError("image inputs require starting this server with --vision")
++            turn = getattr(self.request, "turn", None)    # 9004: the request's turn holder (rank 0, ``app.GlmApp``)
++            if isinstance(turn, dict):
++                turn["runs"] = turn.get("runs", 0) + 1
+             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
+-                                          background=background, glm={"code": code, "spec": spec})
++                                          background=background, glm={"code": code, "spec": spec, "turn": turn})
+             stats.update(policy=spec, drafts=draft)
+             return stats
+         positions: list[int] = []
+diff --git tensorfold/families/glm5_next/cuda/labels.py tensorfold/families/glm5_next/cuda/labels.py
+new file mode 100644
+index 0000000..731badf
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/labels.py
+@@ -0,0 +1,270 @@
++"""Patch 9004: the labels of a conversation's visible structure, for turn records kept with their states.
++
++A label names a conversation through one of its assistant turns by what every client sends back of it: the roles of
++its messages in order, each message's rendered text, the tools block and the effort line. Never the reasoning: clients
++drop it, trim it or rewrite it. It comes from ONE marked render: the template's own render of the request, with
++per-request marks (``\\x00``-delimited, a fresh nonce each render) at the start of each message's content and around
++each assistant turn's reasoning. Taking the marks out gives the production text byte for byte (``Render.real``);
++taking the reasoning spans out as well gives the label text (``Render.label``). A message starts where its mark sits,
++minus the template text that must precede it (``<|user|>``, ``<|assistant|><think>``, ...). A start that does not read
++as expected is no boundary at all, so a label is never guessed: anything unexpected is a miss.
++
++A label is bound to structure, not only to text: the roles and each message's own span are hashed separately, so a
++record with an extra hidden turn can never equal a request whose same bytes sit inside one message.
++
++Labels come from ONE pass: a running sha256 is fed the header, then each message in order (its role; its span
++when its start is verified, each span running to the next verified start), and a copy is finished at each
++assistant turn's end. A request's labels take one pass over its render (a second keeps the running hash before the
++generation prompt), so the cost grows with the conversation, not with turns x size.
++A reply's label at its end continues the request's own pass with the reply message rendered alone
++(``prefix_state``, ``continue_label``): the template renders an assistant message the same wherever it sits,
++except whether its reasoning shows, which labels leave out."""
++
++from __future__ import annotations
++
++import copy
++import hashlib
++import re
++import secrets
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++LABEL_VERSION = 4
++# chat_template_kwargs keys a request may set and still take the label path : anything else could
++# replace the conversation (``messages``), the tools header (``tools``) or the prompt's end (``add_generation_prompt``)
++ALLOWED_KWARGS = frozenset({"clear_thinking", "enable_thinking", "reasoning_effort", "thinking"})
++GEN = "<|assistant|><think>"                     # the generation prompt of a thinking request
++EXPECT = {"user": ("<|user|>",), "system": ("<|system|>",), "developer": ("<|system|>",),
++          "assistant": ("<|assistant|><think>", "<|assistant|><think></think>"),
++          "tool": ("<|observation|><tool_response>",)}
++
++
++def kwargs_allowed(kwargs: Any) -> bool:
++    """Whether a request's ``chat_template_kwargs`` let it take the label path (absent or allowlisted keys only)."""
++
++    return kwargs is None or (isinstance(kwargs, dict) and set(kwargs) <= ALLOWED_KWARGS)
++
++
++def _text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
++    return ""
++
++
++def reasoning_of(m: dict[str, Any]) -> tuple[str | None, Any]:
++    """(reasoning or None, content) of an assistant message, by the template's own rule: ``reasoning_content`` (or
++    ``reasoning``) when it is a string, else a ``<think>...</think>`` block at the start of the content."""
++
++    rc = m.get("reasoning_content")
++    if not isinstance(rc, str) and isinstance(m.get("reasoning"), str):
++        rc = m["reasoning"]
++    content = m.get("content")
++    if isinstance(rc, str):
++        return rc, content
++    text = _text(content)
++    if "</think>" in text:
++        return text.split("</think>")[0].split("<think>")[-1], text.split("</think>")[-1]
++    return None, content
++
++
++def digest(text: Any) -> str:
++    """A reasoning text's digest as compared between a record and a request: stripped; "" is ``EMPTY``."""
++
++    text = text.strip() if isinstance(text, str) else ""
++    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:32] if text else "EMPTY"
++
++
++class Marks:
++    """One render's marks: ``m`` at a message's content start, ``rs`` / ``re`` around an assistant's reasoning."""
++
++    def __init__(self, nonce: str | None = None) -> None:
++        self.nonce = nonce or secrets.token_hex(8)
++        self.pattern = re.compile("\x00tf-(m|rs|re)-" + re.escape(self.nonce) + r":(\d+)\x00")
++
++    def __call__(self, kind: str, i: int) -> str:
++        return f"\x00tf-{kind}-{self.nonce}:{i}\x00"
++
++    def apply(self, messages: list[Any]) -> list[Any]:
++        """A deep copy of ``messages`` with every message's marks in place (assistant reasoning always defined, "" when
++        the message has none, which the template renders exactly as no reasoning: ``<think></think>``)."""
++
++        out = []
++        for i, m in enumerate(messages):
++            m = copy.deepcopy(m)
++            role = m.get("role") if isinstance(m, dict) else None
++            if role == "assistant":
++                reasoning, content = reasoning_of(m)
++                m.pop("reasoning", None)
++                m["content"] = self("m", i) + _text(content).strip()
++                m["reasoning_content"] = self("rs", i) + (reasoning or "") + self("re", i)
++            elif role in ("user", "system", "developer") or (role == "tool" and isinstance(m.get("content"), str)):
++                c = m.get("content")
++                if isinstance(c, str):
++                    m["content"] = self("m", i) + c
++                elif isinstance(c, list):
++                    m["content"] = [{"type": "text", "text": self("m", i)}] + c
++            out.append(m)
++        return out
++
++
++@dataclass
++class Render:
++    """A marked render, analysed: the production text (``real``), the label text (reasoning spans out), and where
++    each message with a verified start begins in each, by message index; ``roles``: every message's role."""
++
++    real: str
++    label: str
++    start_real: dict[int, int] = field(default_factory=dict)
++    start_label: dict[int, int] = field(default_factory=dict)
++    roles: list[str] = field(default_factory=list)
++
++
++def analyse(text: str, messages: list[Any], marks: Marks) -> Render:
++    """Split a marked render into its production text and label text, and verify each message's start."""
++
++    real: list[str] = []
++    label: list[str] = []
++    rlen = llen = pos = 0
++    hidden = False
++    first: dict[tuple[int, str], tuple[int, int]] = {}          # (message, kind) -> (real offset, label offset)
++    for m in marks.pattern.finditer(text):
++        piece = text[pos:m.start()]
++        real.append(piece)
++        rlen += len(piece)
++        if not hidden:
++            label.append(piece)
++            llen += len(piece)
++        kind, i = m.group(1), int(m.group(2))
++        first.setdefault((i, kind), (rlen, llen))
++        hidden = kind == "rs" or (hidden and kind != "re")
++        pos = m.end()
++    real.append(text[pos:])
++    if not hidden:
++        label.append(text[pos:])
++    out = Render("".join(real), "".join(label), roles=[str(m.get("role")) if isinstance(m, dict) else "" for m in
++                                                         messages])
++    i = 0
++    while i < len(messages):
++        role = out.roles[i]
++        if role == "tool":                           # a block of results: the first rendered one opens <|observation|>
++            j = i
++            while j < len(messages) and out.roles[j] == "tool":
++                j += 1
++            found = [first[(k, "m")] for k in range(i, j) if (k, "m") in first]
++            if found:
++                r0, l0 = min(found)
++                _verify(out, i, r0, l0, EXPECT["tool"][0])
++            i = j
++            continue
++        if role == "assistant":
++            if (i, "rs") in first:
++                r0, l0 = first[(i, "rs")]
++                _verify(out, i, r0, l0, EXPECT["assistant"][0])
++            elif (i, "m") in first:
++                r0, l0 = first[(i, "m")]
++                _verify(out, i, r0, l0, EXPECT["assistant"][1])
++        elif role in EXPECT and (i, "m") in first:
++            r0, l0 = first[(i, "m")]
++            _verify(out, i, r0, l0, EXPECT[role][0])
++        i += 1
++    return out
++
++
++def _verify(out: Render, i: int, r0: int, l0: int, pre: str) -> None:
++    if r0 >= len(pre) and out.real[r0 - len(pre):r0] == pre and out.label[l0 - len(pre):l0] == pre:
++        out.start_real[i], out.start_label[i] = r0 - len(pre), l0 - len(pre)
++
++
++def blob(x: str | bytes) -> bytes:
++    """``x`` as it is hashed: its UTF-8 bytes (a lone surrogate kept as is), after their length."""
++
++    b = x.encode("utf-8", "surrogatepass") if isinstance(x, str) else x
++    return len(b).to_bytes(8, "little") + b
++
++
++def _pass(ns: bytes, render: Render, stop: int | None = None):
++    """Run the one pass: yields (message index, the hash after that message). ``stop``: where the text ends for the
++    last span (the generation prompt's start), else the text's end."""
++
++    starts = sorted(render.start_label)
++    h = hashlib.sha256(ns)
++    h.update(blob(render.label[:render.start_label[starts[0]]]))
++    end = len(render.label) if stop is None else stop
++    after = {s: (starts[k + 1] if k + 1 < len(starts) else None) for k, s in enumerate(starts)}
++    for i, role in enumerate(render.roles):
++        h.update(blob(role))
++        if i in render.start_label:
++            nxt = after[i]
++            hi = render.start_label[nxt] if nxt is not None else end
++            h.update(b"S" + blob(render.label[render.start_label[i]:hi]))
++        else:
++            h.update(b"N")
++        yield i, h
++
++
++def struct_labels(ns: bytes, render: Render) -> dict[int, str]:
++    """{assistant message j: its label}, for each assistant turn whose start and end (the next message's start) are
++    verified."""
++
++    if not render.start_label:
++        return {}
++    out: dict[int, str] = {}
++    n = len(render.roles)
++    for i, h in _pass(ns, render):
++        if render.roles[i] == "assistant" and i in render.start_label and i + 1 < n and i + 1 in render.start_label:
++            out[i] = h.copy().hexdigest()[:32]
++    return out
++
++
++def prefix_state(ns: bytes, render: Render):
++    """The pass over a request's whole render, its last span cut before the generation prompt: what a reply's label
++    continues from (``continue_label``). None when the render does not end on the generation prompt or has no start."""
++
++    if not render.start_label or not render.label.endswith(GEN):
++        return None
++    h = None
++    for _, h in _pass(ns, render, stop=len(render.label) - len(GEN)):
++        pass
++    return h.copy() if h is not None else None
++
++
++def continue_label(state, reply: Render) -> str | None:
++    """The label of a reply's turn: the request's pass (``prefix_state``) continued with the reply message, rendered
++    alone without a generation prompt (``reply``: one assistant message). None when its start is not verified."""
++
++    if state is None or reply.roles != ["assistant"] or 0 not in reply.start_label:
++        return None
++    h = state.copy()
++    h.update(blob("assistant"))
++    h.update(b"S" + blob(reply.label[reply.start_label[0]:]))
++    return h.hexdigest()[:32]
++
++
++def file_sha256(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for block in iter(lambda: f.read(1 << 20), b""):
++            h.update(block)
++    return h.hexdigest()
++
++
++def content_id(model_dir: Path) -> str:
++    """The checkpoint's content: its weight files' blob names in a Hugging Face snapshot (content hashes), else each
++    file's name and size (a local folder: weaker, but a change of weights still shows)."""
++
++    parts = []
++    for p in sorted(Path(model_dir).glob("*.safetensors")):
++        target = p.resolve()
++        parts.append(f"{p.name}={target.name if target != p else p.stat().st_size}")
++    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
++
++
++def namespace(tokenizer_sha: str, template_sha: str, clear_thinking: bool, checkpoint: str, salt: str = "") -> bytes:
++    """The namespace every label lives in: a change of tokenizer, template, thinking rule or weights
++    starts a new one, so no record made under another can ever match."""
++
++    return hashlib.sha256("|".join(["tf-glm-label", str(LABEL_VERSION), tokenizer_sha, template_sha,
++                                    str(int(bool(clear_thinking))), checkpoint, salt]).encode()).digest()
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 2753604..aab5f6b 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -458,6 +458,7 @@ class Lane:
+     copy_rounds: int = 0
+     copy_drafted: int = 0
+     copy_accepted: int = 0
++    inherit: Any = None                # 9004, rank 0: the record its own kept state takes (``_turn_inherit``)
+ 
+ 
+ class NoRoom(RuntimeError):
+@@ -557,6 +558,7 @@ class MultiDecoder:
+         self.sent = self.received = 0                     # messages sealed on rank 0, unsealed on rank 1
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
++        self.record_due: set = set()                     # 9004, rank 0: kids whose turn record is on its way
+         self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.next_chat = 0
+@@ -895,6 +897,7 @@ class MultiDecoder:
+             self.broken = exc
+             raise
+         self.lanes[sid].key = key
++        self.lanes[sid].inherit = self._turn_inherit(hit, prompt) if hit is not None else None
+ 
+     def _encode(self, prepared, cut: int):
+         """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
+@@ -1074,6 +1077,7 @@ class MultiDecoder:
+         snap.extent = lane.extent
+         snap.shared = n in lane.shared
+         snap.own, snap.chat = bool(own), int(lane.chat)
++        self._turn_kept(lane, snap)
+         # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
+         for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
+             self._drop(c, spill=False)
+@@ -1137,6 +1141,7 @@ class MultiDecoder:
+             from .decode import snapshot_bytes
+ 
+             held = snapshot_bytes(c)
++        self._turn_release(c.kid)
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+@@ -1147,6 +1152,69 @@ class MultiDecoder:
+         if held >= (64 << 20):
+             self._release()
+ 
++    # -- 9004: turn records on kept prompts (rank 0 only; rank 1 never has one, no message carries one) -----------------
++    def _turn_kept(self, lane: Lane, snap) -> None:
++        """``_keep``: the request's own state (its grid point, never a shared-prefix one) is named in its turn holder
++        (``glm['turn']``) and takes the record the request continued (``lane.inherit``). Never raises."""
++
++        try:
++            if self.rank != 0 or snap.shared or lane.point is None or len(snap.ids) != lane.point:
++                return
++            holder = (getattr(lane.s, "glm", None) or {}).get("turn")
++            if isinstance(holder, dict):
++                holder["kid"] = snap.kid
++            if lane.inherit is not None:
++                tail, body, key = lane.inherit
++                snap._turn_tail, snap.turn, snap.turn_key = list(tail), body, str(key)
++        except Exception:                         # noqa: BLE001  (9004: only a record is lost, never the engine)
++            pass
++
++    def _turn_inherit(self, hit, prompt: list[int]):
++        """``admit``: (tail, body, key) of the record on the kept prompt a request resumes from, when the prompt
++        continues that record's tokens (its tail follows its base: ``hit.ids`` is the prompt's prefix already); else
++        None. Never raises."""
++
++        try:
++            key = getattr(hit, "turn_key", None)
++            if not key:
++                return None
++            base = int(key.rsplit("|", 1)[1])
++            tail = hit._turn_tail
++            if tail is None:                     # read back from disk: the body's tokens, parsed once
++                from .turn_records import body_tail
++
++                tail = hit._turn_tail = body_tail(hit.turn)
++            if base > len(hit.ids) or prompt[base:base + len(tail)] != tail:
++                return None
++            return list(tail), hit.turn, key
++        except Exception:                         # noqa: BLE001
++            return None
++
++    def _turn_due(self, lane: Lane) -> None:
++        """``finish``, a reply the model ended: its own kept state waits for its record before an early write."""
++
++        try:
++            holder = (getattr(lane.s, "glm", None) or {}).get("turn")
++            kid = holder.get("kid") if isinstance(holder, dict) else None
++            if kid is not None and any(c.kid == kid for c in self.kept):
++                self.record_due.add(kid)
++                holder["due"] = True
++        except Exception:                         # noqa: BLE001
++            pass
++
++    def _turn_held(self, c) -> bool:
++        return c.kid in getattr(self, "record_due", ())
++
++    def _turn_release(self, kid) -> None:
++        due = getattr(self, "record_due", None)
++        if due is not None:
++            due.discard(kid)
++
++    def release_due(self, kid) -> None:
++        """Rank 0, the request's own thread: its record landed on its state, or none will: early writes may take it."""
++
++        self._turn_release(kid)
++
+     def _settle(self, x) -> None:
+         if x.owner is not None:
+             return
+@@ -1373,6 +1441,8 @@ class MultiDecoder:
+                 break
+             if (c.images and c.key is None) or c.kid in skip:    # (pictures without content keys: never written)
+                 continue
++            if self._turn_held(c):                # 9004: its turn record is on its way; written once it lands
++                continue
+             if d.has(self._ident(c), self._key(c)) or self._superseded(c):
+                 covered += len(c.ids)
+                 continue
+@@ -2209,6 +2279,8 @@ class MultiDecoder:
+             reason = CANCELLED if s.error is None and len(s.out) < s.count and not (
+                 s.out and s.out[-1] in self._ends(lane)) else DONE
+             self._emit(FINISH, [lane.sid, reason])
++            if reason == DONE:
++                self._turn_due(lane)
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
+             self.decode_due = self.short_round_due = False
+diff --git tensorfold/families/glm5_next/cuda/turn_records.py tensorfold/families/glm5_next/cuda/turn_records.py
+new file mode 100644
+index 0000000..747446f
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/turn_records.py
+@@ -0,0 +1,278 @@
++"""Patch 9004: turn records, kept as two fields of the kept prompt state they continue (``decode.Snapshot``), so the
++spill tier saves, scans, loads and evicts them with that state: one cache, one eviction.
++
++A record maps a conversation as clients send it back (reasoning dropped, trimmed or rewritten) onto the exact tokens the
++engine read and wrote: ``T = state.ids[:base] + tail``. Its key (``turn_key``, a short plain string the tier keeps in
++RAM) holds what the lookup indexes: the label of the turn it covers, the conversation's call-id vector, ``T``'s sha256,
++how many assistant turns it covers, and ``base``. Its body (``turn``, a one-element list the tier saves but does not
++keep in RAM) holds ``tail`` and the per-turn table that 9005's checks (``resume.verify``) read.
++
++Only a clean finish gets a record: the model's own end token, a closed think block with no call written inside it,
++every call it wrote parsed and sent, one engine run, no ``ignore_eos``, allowlisted ``chat_template_kwargs``, reasoning
++that is not a loop, and not a ``"draft": false`` reference. Its label is the request's own label pass continued with the
++reply message rendered alone (``labels.continue_label``)."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import zlib
++from array import array
++from dataclasses import dataclass, field
++from typing import Any
++
++from . import labels as L
++
++RECORD = "r4"
++_OUR_ID = re.compile(r"^call_[0-9a-f]{24}$")      # the ids this server gives its calls (``server/tools.py``)
++MAX_REASONING_TOKENS = 65536        # a longer reasoning is not recorded
++LOOP_RATIO = 8.0                     # a reasoning tail compressing past this is a loop (issue #89)
++LOOP_TAIL = 16 << 10                 # bytes of the reasoning's end the ratio is measured on
++LOOP_MIN = 1 << 10                   # shorter tails are never judged
++
++
++# -- the record's two fields ---------------------------------------------------------------------------------------
++def record_key(label: str, idvec: str, t_sha: str, turns: int, base: int) -> str:
++    return f"{RECORD}|{label}|{idvec}|{t_sha}|{int(turns)}|{int(base)}"
++
++
++def parse_key(key: Any) -> dict[str, Any] | None:
++    """The fields of a record key, or None for anything that is not one."""
++
++    if not isinstance(key, str):
++        return None
++    parts = key.split("|")
++    if len(parts) != 6 or parts[0] != RECORD:
++        return None
++    try:
++        return {"label": parts[1], "idvec": parts[2], "t_sha": parts[3], "turns": int(parts[4]),
++                "base": int(parts[5])}
++    except ValueError:
++        return None
++
++
++def record_body(tail: list[int], table: list[dict[str, Any]]) -> list[str]:
++    return [json.dumps({"tail": [int(t) for t in tail], "turns": table}, ensure_ascii=False, separators=(",", ":"))]
++
++
++def _body(body: Any) -> dict[str, Any]:
++    if not (isinstance(body, list) and len(body) == 1 and isinstance(body[0], str)):
++        raise ValueError("not a record body")
++    out = json.loads(body[0])
++    if not isinstance(out, dict) or not isinstance(out.get("tail"), list) or not isinstance(out.get("turns"), list):
++        raise ValueError("not a record body")
++    return out
++
++
++def body_tail(body: Any) -> list[int]:
++    return [int(t) for t in _body(body)["tail"]]
++
++
++def body_table(body: Any) -> list[dict[str, Any]]:
++    return list(_body(body)["turns"])
++
++
++def t_digest(T: list[int]) -> str:
++    """sha256 of T as 32-bit integers (native order; checked against records made on the same machine)."""
++
++    return hashlib.sha256(array("i", T).tobytes()).hexdigest()
++
++
++def idvec_digest(ids: list[list[str]]) -> str:
++    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode()).hexdigest()[:32]
++
++
++def continues(state: Any, T: list[int]) -> bool:
++    """Whether the record on ``state`` (if any) describes a prefix of ``T``: the same conversation's earlier turn.
++    ``state.ids`` must already be a prefix of ``T`` (the caller's own state)."""
++
++    key = parse_key(getattr(state, "turn_key", None))
++    if key is None:
++        return True
++    tail = state._turn_tail if getattr(state, "_turn_tail", None) is not None else body_tail(state.turn)
++    base = key["base"]
++    return base <= len(state.ids) and T[base:base + len(tail)] == tail
++
++
++# -- which replies get one --------------------------------------------------------------------------------------------
++@dataclass
++class Turn:
++    """An assistant turn of a request as rendered: its message index (after ``agent_history``), where its reasoning
++    came from, its digest, its call ids as presented, whether the template shows its reasoning, its visible text."""
++
++    msg: int
++    prov: str                        # own | client | restored-id | restored-sig | empty
++    digest: str
++    ids: list[str]
++    shown: bool
++    content: str = ""
++
++    def record(self) -> dict[str, Any]:
++        return {"msg": self.msg, "prov": self.prov, "digest": self.digest, "ids": self.ids, "shown": self.shown}
++
++
++@dataclass
++class View:
++    """A request seen through one marked render: what a record of its reply is built from (``prefix``: the label
++    pass through the request, cut before the generation prompt), and what 9005's lookup found."""
++
++    ns: str
++    render: L.Render
++    history: list[Any]
++    turns: list[Turn]
++    labels: dict[int, str] = field(default_factory=dict)
++    prefix: Any = None
++    hit: Any = None
++    hit_turn: int | None = None
++    t_len: int = 0
++    suffix: int = 0
++    reason: str = ""
++    context: list[int] | None = None
++    hit_table: list[dict[str, Any]] | None = None    # the hit record's rows for the turns it covers (9005)
++
++
++def loop_reason(reasoning: str, content: str, calls: Any, reasoning_tokens: int,
++                max_tokens: int = MAX_REASONING_TOKENS) -> str | None:
++    """Why a reply's reasoning must not be carried into later turns, or None."""
++
++    if not (content or "").strip() and not calls:
++        return "an empty answer"
++    if reasoning_tokens > max_tokens:
++        return f"reasoning over {max_tokens} tokens"
++    tail = (reasoning or "")[-LOOP_TAIL:].encode("utf-8", "surrogatepass")
++    if len(tail) >= LOOP_MIN and len(tail) / max(1, len(zlib.compress(tail, 6))) > LOOP_RATIO:
++        return "repetitive reasoning"
++    return None
++
++
++def eligibility(*, chat: bool, thinking: bool, draft: bool, ignore_eos: bool, kwargs: Any, pictures: bool,
++                result: dict[str, Any], out: list[int], think_close: int | None, call_open: int | None,
++                runs: int = 1, max_reasoning: int = MAX_REASONING_TOKENS) -> str | None:
++    """Why a finished reply gets no record, or None."""
++
++    if not chat:
++        return "not a chat request"
++    if not thinking:
++        return "thinking off"
++    if pictures:
++        return "pictures"
++    if not draft:
++        return "draft:false"
++    if ignore_eos:
++        return "ignore_eos"
++    if not L.kwargs_allowed(kwargs):
++        return "chat_template_kwargs"
++    if runs != 1:
++        return "several engine runs"
++    if not result.get("ended"):
++        return "not ended by the model"
++    if think_close is None or think_close not in out:
++        return "no </think>"
++    if call_open is not None and call_open in out and out.index(call_open) < out.index(think_close):
++        return "a call in the think block"         # a model slip: one cache miss is its whole cost
++    if result.get("closed_call"):
++        return "a call the server closed"
++    calls = result.get("calls") or []
++    if call_open is not None and out.count(call_open) != len(calls):
++        return "calls cut"
++    return loop_reason(result.get("reasoning") or "", result.get("content") or "", calls,
++                       int(result.get("reasoning_tokens") or 0), max_reasoning)
++
++
++def reply_message(result: dict[str, Any]) -> dict[str, Any]:
++    """The reply as a client would send it back with its reasoning: the message its label covers."""
++
++    m: dict[str, Any] = {"role": "assistant", "content": result.get("content") or "",
++                         "reasoning_content": result.get("reasoning") or ""}
++    if result.get("calls"):
++        m["tool_calls"] = [dict(c) for c in result["calls"]]
++    return m
++
++
++def make_record(template, view: View, result: dict[str, Any], *, prompt: list[int], out: list[int], tools: Any,
++                kwargs: dict[str, Any] | None, base: int) -> tuple[str, list[str], list[int]] | str:
++    """(key, body, tail) of an eligible reply's record on a state of ``base`` tokens, or why not."""
++
++    marks = L.Marks()
++    text, history = template.render_marked([reply_message(result)], tools=tools,
++                                           extra={**(kwargs or {}), "add_generation_prompt": False}, marks=marks)
++    label = L.continue_label(view.prefix, L.analyse(text, history, marks))
++    if label is None:
++        return "label"
++    T = list(prompt) + list(out[:-1])
++    if not 0 < base <= len(prompt):
++        return "state outside the prompt"
++    reply = Turn(len(view.history), "own", L.digest(result.get("reasoning")),
++                 [c["id"] for c in result.get("calls") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)],
++                 True)
++    turns = [*view.turns, reply]
++    idvec = idvec_digest([t.ids for t in turns if t.ids])
++    rows = [t.record() for t in turns]
++    if view.hit is not None and view.hit_table is not None and view.hit_turn is not None:
++        # served from a record: T holds the turns it covered as that record says (their thinking included), not as
++        # this request presented them (a client that dropped the thinking would make them look empty)
++        rows = [*view.hit_table, *(t.record() for t in view.turns if t.msg > view.hit_turn), reply.record()]
++    tail = T[base:]
++    return (record_key(label, idvec, t_digest(T), len(turns), base), record_body(tail, rows), tail)
++
++
++# -- the request's side ----------------------------------------------------------------------------------------------
++def _text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
++    return ""
++
++
++def turns_of(original: list[Any], history: list[Any], clear_thinking: bool) -> list[Turn] | None:
++    """Every assistant turn as rendered, with its provenance (what ``resume.verify`` checks): the client's own
++    reasoning (``client``), else reasoning 0036 put back (``restored-id`` when a call id is ours, else
++    ``restored-sig``), else ``empty``.
++    None when the client's assistant messages and the rendered ones cannot be paired one to one."""
++
++    sent = [m for m in original if isinstance(m, dict) and m.get("role") == "assistant"]
++    rendered = [(i, m) for i, m in enumerate(history) if isinstance(m, dict) and m.get("role") == "assistant"]
++    if len(sent) != len(rendered):
++        return None
++    last_user = max((i for i, m in enumerate(history) if isinstance(m, dict) and m.get("role") == "user"), default=-1)
++    out = []
++    for client, (i, m) in zip(sent, rendered):
++        own, _ = L.reasoning_of(client)
++        now, content = L.reasoning_of(m)
++        ids = [c["id"] for c in client.get("tool_calls") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)]
++        if isinstance(own, str) and own.strip():
++            prov, text = "client", own
++        elif isinstance(now, str) and now.strip():
++            prov, text = ("restored-id" if any(_OUR_ID.match(c) for c in ids) else "restored-sig"), now
++        else:
++            prov, text = "empty", ""
++        shown = not clear_thinking or i > last_user
++        out.append(Turn(i, prov, L.digest(text), ids, shown, _text(content).strip()))
++    return out
++
++
++def view(template, body: dict[str, Any], prepared, ns: bytes, clear_thinking: bool) -> View | str:
++    """The request through one marked render, or why it takes no label path."""
++
++    if not prepared.thinking:
++        return "thinking off"
++    if not L.kwargs_allowed(body.get("chat_template_kwargs")):
++        return "chat_template_kwargs"
++    if prepared.vision is not None or prepared.text is None:
++        return "pictures"
++    # the thinking rule this request renders with (its own clear_thinking, else the server's) is part of its
++    # namespace: a record made under the other rule never serves it
++    clear = bool((prepared.template_kwargs or {}).get("clear_thinking", clear_thinking))
++    ns = hashlib.sha256(ns + (b"|clear:1" if clear else b"|clear:0")).digest()
++    marks = L.Marks()
++    text, history = template.render_marked(body["messages"], tools=prepared.tools, extra=prepared.template_kwargs,
++                                           marks=marks)
++    r = L.analyse(text, history, marks)
++    if r.real != prepared.text:
++        return "render differs"
++    turns = turns_of(body["messages"], history, clear)
++    if turns is None:
++        return "unpaired turns"
++    return View(ns.hex(), r, history, turns, L.struct_labels(ns, r), L.prefix_state(ns, r))
