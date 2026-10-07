@@ -64,6 +64,16 @@ prompts also read its `tokenizer.json`, `chat_template.jinja` and `tokenizer_con
 `TF_GLM_TEST_MODEL_DIR` names (a checkpoint snapshot); without it they are skipped. The picture tests also need
 `torchvision`, and the clip test PyAV (without it, it is skipped).
 
+## Measuring it on your own setup
+
+`tools/resume_bench.py` runs every test above against a running server and writes `results.json` and `results.md`: the
+engine's start with and without its compiled kernels; a conversation picked up hot and cold, plain and with a tool call,
+each checked token for token against a fresh read; the screenshot conversation; and replies while a long request or many
+screenshots arrive. What depends on your engine is a few executables of yours (`restart`, `clear-buffers`, optionally
+`clear-kernel-cache` and `node-info`: `tools/resume_bench.py --help` describes them). Run it once on the recipe and once
+with these patches, with the same `--seed`, and `tools/resume_bench.py report before.json after.json` prints both side
+by side. Its own CPU tests: `tests/test_resume_bench.py`.
+
 ## License
 
 Apache-2.0, like the recipe (see `LICENSE` and `NOTICE`). `9003` back-ports a TensorFold commit whose authors are
