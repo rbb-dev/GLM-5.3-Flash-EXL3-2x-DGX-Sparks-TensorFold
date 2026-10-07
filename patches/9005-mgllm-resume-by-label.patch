@@ -1,0 +1,224 @@
+# Resume by label: a chat request whose visible conversation continues a turn record (9004) is served that record's
+# exact tokens, thinking included, then the tokens of its own render after that turn, so a client that drops the
+# thinking still finds its kept or stored prompt state by exact prefix, also after a restart. At prepare time, on the
+# request thread, the records are indexed afresh from the kept states' keys and the spill tier's in-RAM fields; the
+# deepest label whose records hold one set of tokens for the request's call ids wins once its record is unchanged, every
+# earlier turn passes the record's checks (reasoning sent back must equal the record's; foreign reasoning must be sent
+# every time; a turn whose reasoning was dropped needs its call ids, or 64 visible characters, to prove it was ours) and
+# the tokens' sha256 matches. Anything doubtful, or a context that would not fit, is a miss: today's render serves the
+# request, never a refusal. The sampling seed follows the served prompt; /v1/messages/count_tokens counts it; /tokenize
+# still renders. Rank 0 only. mgllm, 2026-10-07.
+# Tests: tests/test_9005_resume.py (CPU; needs TF_GLM_TEST_MODEL_DIR).
+
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 97f0e58..d6cbd0e 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ import os
+ from collections import Counter
+ from pathlib import Path
+@@ -9,7 +10,7 @@ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.server.errors import CONTEXT_LIMIT
+-from tensorfold.families.glm5_next.cuda import labels, turn_records
++from tensorfold.families.glm5_next.cuda import labels, resume, turn_records
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+ from tensorfold.families.glm5_next.cuda.turn_records import View
+ from tensorfold.families.glm5_next.prompts import agent_history, effort_tail_enabled, effort_to_tail, thinking_off
+@@ -107,7 +108,8 @@ class GlmApp(App):
+ 
+     def prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+         """``App.prepare``, then (9004) the request seen through one marked render: its labels, and the label pass a
+-        record of its reply continues. Read-only; any error leaves today's request unchanged."""
++        record of its reply continues; (9005) its prompt continued from its conversation's record when one verifies.
++        Read-only; any doubt or error leaves today's request unchanged."""
+ 
+         prepared = super().prepare(body, chat)
+         if chat and self.label_ns is not None:
+@@ -116,8 +118,34 @@ class GlmApp(App):
+                                                     self.template.clear_thinking)
+             except Exception as exc:             # noqa: BLE001
+                 prepared.resume = f"error: {exc!r}"
++            return self._resumed(body, prepared)
+         return prepared
+ 
++    def _resumed(self, body: dict[str, Any], prepared: PreparedRequest) -> PreparedRequest:
++        """9005: the prompt as the record's exact tokens and only the request's new part (``resume.lookup``), when a
++        record verifies and fits the context limit; else ``prepared`` unchanged (a miss, never a refusal)."""
++
++        v = prepared.resume
++        if isinstance(v, View):
++            try:
++                resume.lookup(getattr(self.engine, "multi", None), self.tok, v)
++            except Exception as exc:             # noqa: BLE001
++                v.hit, v.reason = None, f"error: {exc!r}"
++        if not isinstance(v, View) or v.hit is None:
++            self.record_counts["miss: " + (v if isinstance(v, str) else v.reason).split(":")[0]] += 1
++            return prepared
++        hit = dataclasses.replace(prepared, prompt=v.context, sampling=self.sampling_for(body, v.context),
++                                  max_tokens=self._requested_tokens(body))
++        if self.check(body, prepared=hit) is not None:      # never refuse what today's render would serve
++            v.hit, v.context, v.reason = None, None, "context limit"
++            self.record_counts["miss: context limit"] += 1
++            return prepared
++        limit = self._context_limit()
++        if limit is not None:
++            hit.max_tokens = min(hit.max_tokens, limit - len(hit.prompt))
++        self.record_counts["hit"] += 1
++        return hit
++
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/resume.py tensorfold/families/glm5_next/cuda/resume.py
+new file mode 100644
+index 0000000..2bca4e6
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/resume.py
+@@ -0,0 +1,140 @@
++"""Patch 9005: a request resumed from its conversation's turn record (9004, ``turn_records``: the record is a field
++of the kept or stored prompt state it continues).
++
++At prepare time (rank 0, read-only) the request has been seen through one marked render (``turn_records.view``). The
++records it could continue are indexed afresh from the kept states' and the spill tier's stored entries' record keys
++(small strings both already hold in RAM), so the index is never stale. The deepest label with exactly one ``T`` for the
++request's call ids, whose record still is what the index saw and whose every earlier turn passes ``verify``, wins:
++the prompt becomes that record's exact tokens, thinking included, then the tokens of the request's own render after
++that turn. The engine's own resume finds the record's state (in memory, or read back from the SSD) by exact prefix.
++Anything doubtful is a miss, and today's render serves the request unchanged."""
++
++from __future__ import annotations
++
++import json
++import os
++from typing import Any
++
++from .turn_records import Turn, View, body_table, body_tail, idvec_digest, parse_key, t_digest
++
++ORIGIN_CHARS = 64            # a text turn's visible content that proves it was ours (verify, rows 10-11)
++
++
++def verify(turn: Turn, rec: dict[str, Any]) -> str | None:
++    """Why a request's turn cannot continue the record's turn, or None: one row per case, in order."""
++
++    holds = rec["digest"] != "EMPTY" and rec.get("shown", True)      # T carries this turn's reasoning
++    sent = turn.prov == "client"
++    if not turn.shown:
++        return "hidden reasoning in the record" if holds else None             # rows 1-2
++    if not holds:
++        return "reasoning the record does not hold" if sent else None          # rows 3-4
++    if sent:
++        return None if turn.digest == rec["digest"] else "reasoning differs"   # rows 5-6
++    if rec["prov"] == "client":
++        return "foreign reasoning not presented"                               # row 7
++    if rec["ids"]:
++        return None if turn.ids == rec["ids"] else "call ids differ"           # rows 8-9
++    if rec["prov"] == "own" and len(turn.content) >= ORIGIN_CHARS:
++        return None                                                            # row 10
++    return "origin unproven"                                                   # row 11
++
++
++def carriers(multi: Any) -> list[tuple[str, Any, str, dict[str, Any]]]:
++    """(where, state or entry, key string, key fields) of every record the engine holds: kept states first."""
++
++    out = []
++    for c in list(getattr(multi, "kept", None) or ()):
++        key = parse_key(getattr(c, "turn_key", None))
++        if key is not None:
++            out.append(("kept", c, c.turn_key, key))
++    disk = getattr(multi, "disk", None)
++    if disk is not None:
++        with disk.lock:
++            entries = list(disk.index.values())
++        for e in entries:
++            if getattr(e, "bad", False):         # its write failed on a rank: a read would fail (the tier forgets it)
++                continue
++            text = (getattr(e, "fields", None) or {}).get("turn_key")
++            key = parse_key(text)
++            if key is not None:
++                out.append(("disk", e, text, key))
++    return out
++
++
++def current_key(multi: Any, carrier: tuple) -> str | None:
++    """The record key the carrier holds now (the index was built a moment ago; another reply may have replaced it)."""
++
++    where, obj = carrier[0], carrier[1]
++    if where == "kept":
++        return getattr(obj, "turn_key", None)
++    with multi.disk.lock:
++        e = multi.disk.index.get(obj.key)
++    return (e.fields or {}).get("turn_key") if e is obj else None
++
++
++def read_body(disk: Any, entry: Any) -> list[str] | None:
++    """A stored state's record body, from its file's header (the ``turn`` field ``spill.encode`` wrote)."""
++
++    from tensorfold.cuda import spill
++
++    with open(os.path.join(disk.dir, entry.name + ".safetensors"), "rb") as f:
++        header, _ = spill._read_header_file(f)
++    layers = json.loads((header.get("__metadata__") or {}).get("layers") or "[]")
++    spec = layers[0]["fields"].get("turn") if layers else None
++    body = spill._dec(spec, {}) if spec else None
++    return body if isinstance(body, list) else None
++
++
++def lookup(multi: Any, tok: Any, v: View) -> View:
++    """The deepest record ``v`` continues: sets ``hit``, ``hit_turn``, ``t_len``, ``suffix`` and ``context``; else
++    ``reason`` says why not (the deepest label's reason)."""
++
++    v.reason = "no record"
++    index: dict[str, list[tuple]] = {}
++    for c in carriers(multi):
++        index.setdefault(c[3]["label"], []).append(c)
++
++    def miss(why: str) -> None:
++        if v.reason == "no record":
++            v.reason = why
++
++    for j in sorted(v.labels, reverse=True):
++        found = index.get(v.labels[j])
++        if not found:
++            continue
++        covered = [t for t in v.turns if t.msg <= j]
++        iv = idvec_digest([t.ids for t in covered if t.ids])
++        same = [c for c in found if c[3]["idvec"] == iv and c[3]["turns"] == len(covered)]
++        if not same:
++            continue
++        if len({c[3]["t_sha"] for c in same}) > 1:
++            miss("ambiguous")
++            continue
++        carrier = same[0]
++        if current_key(multi, carrier) != carrier[2]:
++            miss("record changed")
++            continue
++        try:
++            body = carrier[1].turn if carrier[0] == "kept" else read_body(multi.disk, carrier[1])
++        except Exception:                        # noqa: BLE001  (a file cut short or gone: this label misses)
++            miss("record unreadable")
++            continue
++        table = body_table(body)
++        if len(table) != len(covered):
++            miss("turns differ")
++            continue
++        why = next((w for t, r in zip(covered, table) if (w := verify(t, r)) is not None), None)
++        if why is not None:
++            miss(why)
++            continue
++        head = carrier[1].ids[:carrier[3]["base"]]           # a stored entry's ids are numpy: tolist is ~3x faster
++        T = (head.tolist() if hasattr(head, "tolist") else list(head)) + body_tail(body)
++        if t_digest(T) != carrier[3]["t_sha"]:
++            miss("record damaged")
++            continue
++        suffix = tok.encode(v.render.real[v.render.start_real[j + 1]:], add_special_tokens=False).ids
++        v.hit, v.hit_turn, v.t_len, v.suffix, v.context, v.reason = carrier[2], j, len(T), len(suffix), T + suffix, ""
++        v.hit_table = table                      # a record of this request's reply keeps these rows (turn_records)
++        return v
++    return v

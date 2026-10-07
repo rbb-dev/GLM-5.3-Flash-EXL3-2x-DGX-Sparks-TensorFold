@@ -13,6 +13,7 @@ NOTICE asks, this file states what the fork adds.
 | `9002-mgllm-anthropic-fixes` | Fixes to the recipe's Anthropic Messages API (its `0084`): a `ping` event while a tool call is held, a 400 from `count_tokens` for a request it cannot prepare (503 at capacity), a tool result's pictures kept inside it in order, and request bodies up to the chat route's limit | this fork | Test: `tests/test_9002_stream_and_count.py` |
 | `9003-mgllm-decode-speed` | Each finished request's decode time and decode rate as histograms on `/metrics` | backport of TensorFold c9259c3, plus a rate histogram | Metrics only. Test: `tests/test_9003_decode_speed.py` |
 | `9004-mgllm-turn-records` | Each finished reply's exact tokens, thinking included, recorded on the kept prompt state it ends on, so the spill tier (the recipe's 0088) saves, reads back and evicts them with that state | this fork | Changes nothing a request is served (9005 uses the records). Needs `--parallel` above 1. Tests: `tests/test_9004_*.py` |
+| `9005-mgllm-resume-by-label` | A request whose visible conversation continues a record is served the record's exact tokens plus only what is new, so a client that drops the thinking still resumes its saved state, also after a restart | this fork | Anything doubtful is a miss: today's prompt, never a refusal. Test: `tests/test_9005_resume.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
