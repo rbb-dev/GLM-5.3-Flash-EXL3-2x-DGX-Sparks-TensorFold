@@ -1,0 +1,140 @@
+# Prompts tokenized with Python's lock released. The Rust tokenizer's single-text encode holds the GIL for the whole
+# text, so while one request's prompt is tokenized no other thread of the engine process runs, the decode loop of every
+# other request included: on two GB10s a 1,019,111-token request paused another request's stream for about 2 s, and a
+# /tokenize call does the same. The tokenizer's batch calls release the GIL while Rust tokenizes and return the same ids;
+# every prompt tokenization now goes through encode_batch_fast (encode_batch before tokenizers 0.20), which skips the
+# character offsets prompts never use (tensorfold/cuda/unlocked.py: chat and completion prompts, /tokenize, the media
+# markers' template, a picture request's layout in vision/glm.py, and 9005's new part). Measured on a GB10 core,
+# preparing a 996,815-token chat request (render, tokenize, 9004/9005): every other thread was held off for up to
+# 2,211 ms before, 73 ms after, and the preparation took 2.0 s instead of 2.6 s; laying out a ~400K-token picture
+# request held them off 1,066 ms before (x86 workstation). mgllm, 2026-10-08.
+# Tests: tests/test_9006_unlocked_tokenize.py (CPU; needs TF_GLM_TEST_MODEL_DIR).
+
+diff --git tensorfold/cuda/markers.py tensorfold/cuda/markers.py
+index 645ab61..a4bef54 100644
+--- tensorfold/cuda/markers.py
++++ tensorfold/cuda/markers.py
+@@ -6,6 +6,7 @@ from pathlib import Path
+ from typing import Any, Callable, Sequence
+ 
+ import numpy as np
++from tensorfold.cuda.unlocked import encode_ids
+ 
+ MIN_GAP = 256            # a snapshot this close to the prompt start or to the previous snapshot saves too little
+ 
+@@ -22,7 +23,7 @@ class TemplateTokens:
+                             add_generation_prompt: bool = False, **kwargs: Any):
+         text = self.template.template.render(**self.template.specials, messages=messages,
+                                              add_generation_prompt=add_generation_prompt, **kwargs)
+-        return self.tok.encode(text, add_special_tokens=False).ids if tokenize else text
++        return encode_ids(self.tok, text, False) if tokenize else text      # 9006: the GIL released
+ 
+ 
+ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callable[[Sequence[int]], list[int]]:
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index a360b23..9a85fb3 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -29,6 +29,7 @@ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+                                         close_glm_call, hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.stream_pacing import Playout, smooth_streaming
++from tensorfold.cuda.unlocked import encode_ids
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+@@ -241,14 +242,14 @@ class App:
+             else:
+                 text = render(body["messages"])
+                 plain = text
+-            prompt = self.tok.encode(text, add_special_tokens=False).ids
++            prompt = encode_ids(self.tok, text, False)        # 9006: the GIL released while Rust tokenizes
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+         else:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string or a list of token ids")
+-            prompt = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", False)).ids
++            prompt = encode_ids(self.tok, text, _flag(body, "add_special_tokens", False))
+         if not prompt:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+@@ -290,7 +291,7 @@ class App:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string (or send messages)")
+-            ids = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", True)).ids
++            ids = encode_ids(self.tok, text, _flag(body, "add_special_tokens", True))
+         limit = self._context_limit()
+         return {"count": len(ids), "max_model_len": limit if limit is not None else self.native_context_window,
+                 "tokens": [int(t) for t in ids]}
+diff --git tensorfold/cuda/unlocked.py tensorfold/cuda/unlocked.py
+new file mode 100644
+index 0000000..cdcd8c9
+--- /dev/null
++++ tensorfold/cuda/unlocked.py
+@@ -0,0 +1,21 @@
++"""Patch 9006: tokenize with Python's lock released.
++
++The Rust tokenizer's single-text ``encode`` holds the GIL for the whole text (measured on a GB10 core: 1.75 s for
++996,815 tokens), during which no other thread of the engine process runs, the decode loop of every other request
++included. Its batch calls release the GIL while Rust tokenizes and return the same ids; ``encode_batch_fast`` skips
++the character offsets prompts never use (on a GB10 core as fast as ``encode``; on an x86 workstation twice as fast).
++Only turning the ids into a Python list holds the GIL (about 18 ms at 1M tokens on GB10)."""
++
++from __future__ import annotations
++
++from typing import Any
++
++
++def encode_ids(tok: Any, text: str, add_special_tokens: bool) -> list[int]:
++    """``text``'s token ids, as ``tok.encode(text, add_special_tokens=...).ids`` gives them, without holding the GIL (a
++    tokenizer with no batch call, as the stand-ins in TensorFold's tests are, is asked with ``encode``)."""
++
++    batch = getattr(tok, "encode_batch_fast", None) or getattr(tok, "encode_batch", None)  # _fast: tokenizers 0.20+
++    if batch is None:
++        return tok.encode(text, add_special_tokens=add_special_tokens).ids
++    return batch([text], add_special_tokens=add_special_tokens)[0].ids
+diff --git tensorfold/families/glm5_next/cuda/resume.py tensorfold/families/glm5_next/cuda/resume.py
+index 2bca4e6..c3d7a92 100644
+--- tensorfold/families/glm5_next/cuda/resume.py
++++ tensorfold/families/glm5_next/cuda/resume.py
+@@ -16,6 +16,7 @@ import os
+ from typing import Any
+ 
+ from .turn_records import Turn, View, body_table, body_tail, idvec_digest, parse_key, t_digest
++from tensorfold.cuda.unlocked import encode_ids
+ 
+ ORIGIN_CHARS = 64            # a text turn's visible content that proves it was ours (verify, rows 10-11)
+ 
+@@ -133,7 +134,7 @@ def lookup(multi: Any, tok: Any, v: View) -> View:
+         if t_digest(T) != carrier[3]["t_sha"]:
+             miss("record damaged")
+             continue
+-        suffix = tok.encode(v.render.real[v.render.start_real[j + 1]:], add_special_tokens=False).ids
++        suffix = encode_ids(tok, v.render.real[v.render.start_real[j + 1]:], False)    # 9006: GIL released
+         v.hit, v.hit_turn, v.t_len, v.suffix, v.context, v.reason = carrier[2], j, len(T), len(suffix), T + suffix, ""
+         v.hit_table = table                      # a record of this request's reply keeps these rows (turn_records)
+         return v
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 7369e66..c346e0c 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -23,6 +23,7 @@ from typing import Any
+ 
+ import numpy as np
+ 
++from tensorfold.cuda.unlocked import encode_ids
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ 
+ from .images_http import ImageInputError
+@@ -727,7 +728,7 @@ class GlmVision:
+                 pieces.append(_as_text(rest[:v]) + "<|begin_of_video|>" + frames + "<|end_of_video|>")
+                 items.append(("video", clip.frames))
+                 rest = rest[v + len(VIDEO_SPAN):]
+-        ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
++        ids = encode_ids(self.tok, "".join(pieces), False)          # 9006: the GIL released
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
