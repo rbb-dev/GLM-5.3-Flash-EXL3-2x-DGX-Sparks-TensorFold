@@ -1,0 +1,286 @@
+# Rank 0 encodes a picture prompt's items as the prefill reaches them. A request's pictures were all run through the
+# tower inside its admission, on the scheduler thread (no stream decodes meanwhile: with full-size pictures a 50-picture
+# first read is about 10x today's tower work), and their feature rows (8 KiB a row) stayed on the GPU for the stream's
+# whole life, decode included, adding up across lanes against a reserve sized for one request. Now the feed holds the
+# prompt's items (VisionFeed(prepared=...)); before each prompt chunk's FILL goes out, between rounds, it encodes the
+# items whose rows that chunk covers (_feed_ready -> ensure), and the prefill lets go of the items it has passed
+# (release), so a stream holds at most the rows of the items one chunk covers, and the lane drops its feed once its
+# prompt is in. An encode that fails fails that stream alone, finished as a cancelled one is, before rank 1 hears of
+# the chunk. A request's stats say how long its pictures took and how many were encoded (encode_s, pictures_encoded).
+# A picture stream can now be handed back when the pool is full and replays with its pictures (it was failed instead).
+# Picture rows must sit on the image token, checked at admission. mgllm, 2026-10-08.
+# Tests: tests/test_9014_picture_feed.py (CPU: a fake tower; each chunk's rows equal encoding all items at once).
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6f74961..c28e6e4 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1617,28 +1617,91 @@ class GlmEngine:
+ 
+ 
+ class VisionFeed:
+-    """An image prompt's feature rows for each prefill chunk: rank 0 holds them all, and hands a chunk's rows to
+-    the other ranks through the all-gather as the chunk comes (they send zeros), so no rank holds a second copy."""
++    """An image prompt's feature rows for each prefill chunk: rank 0 holds them, and hands a chunk's rows to the other
++    ranks through the all-gather as the chunk comes (they send zeros), so no rank holds a second copy.
+ 
+-    def __init__(self, engine: GlmEngine, positions: list[int], rows) -> None:
++    9014, ``prepared`` (rank 0): the items are encoded as the prefill reaches them. ``ensure``, between rounds and
++    before a chunk's FILL goes out, encodes the items whose rows the chunk covers; ``release`` lets go of the items the
++    prefill has passed. A long picture conversation never holds all its rows (they stayed for the stream's whole life
++    before), and the tower runs a chunk's pictures at a time instead of all of a request's at its admission."""
++
++    def __init__(self, engine: GlmEngine, positions: list[int], rows, prepared=None) -> None:
+         self.engine, self.positions, self.rows = engine, positions, rows
+         self.width = engine.w.cfg.hidden
+         self.encode_s = 0.0
++        self.items_encoded = 0
++        self.device = getattr(engine, "feed_device", "cuda")
++        self.prepared = prepared
++        self.spans: list[tuple[int, int]] = []      # per item: its first index in ``positions``, its rows
++        self.held: dict[int, Any] = {}               # item -> its rows, while a chunk still needs them
++        at = 0
++        for r in (prepared.item_rows if prepared is not None else []):
++            self.spans.append((at, int(r)))
++            at += int(r)
++
++    def _range(self, start: int, count: int) -> tuple[int, int]:
++        import bisect
++
++        return bisect.bisect_left(self.positions, start), bisect.bisect_left(self.positions, start + count)
++
++    def _items(self, lo: int, hi: int) -> list[int]:
++        return [k for k, (a, r) in enumerate(self.spans) if a < hi and a + r > lo]
++
++    def ensure(self, start: int, count: int) -> None:
++        """9014, rank 0: the rows of prompt rows start .. start + count encoded and held (a whole item at a time)."""
++
++        if self.prepared is None:
++            return
++        lo, hi = self._range(start, count)
++        need = [k for k in self._items(lo, hi) if k not in self.held]
++        if not need:
++            return
++        import time
++        from types import SimpleNamespace
++
++        torch = self.engine.torch
++        t = time.perf_counter()
++        part = SimpleNamespace(items=[self.prepared.items[k] for k in need], item_rows=[self.spans[k][1] for k in need])
++        rows = self.engine.vision.features(part)
++        if rows.shape[0] != sum(part.item_rows):
++            raise ValueError(f"the tower gave {rows.shape[0]} rows for {sum(part.item_rows)} image positions")
++        at = 0
++        for k, r in zip(need, part.item_rows):
++            self.held[k] = rows[at:at + r]
++            at += r
++        if self.device == "cuda":
++            torch.cuda.empty_cache()                 # the tower's scratch goes back before the chunk's own
++        self.encode_s += time.perf_counter() - t
++        self.items_encoded += len(need)
++
++    def release(self, before: int) -> None:
++        """9014, rank 0: let go of the items whose rows all lie before prompt row ``before``."""
++
++        lo, _ = self._range(before, 0)
++        for k in [k for k in self.held if self.spans[k][0] + self.spans[k][1] <= lo]:
++            del self.held[k]
+ 
+     def chunk(self, start: int, count: int):
+         """(row indices within the chunk, their features) for prompt rows start .. start + count, or None."""
+ 
+-        import bisect
+-
+         torch = self.engine.torch
+-        lo = bisect.bisect_left(self.positions, start)
+-        hi = bisect.bisect_left(self.positions, start + count)
++        lo, hi = self._range(start, count)
+         if lo == hi:
+             return None
+         n = hi - lo
+-        mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
+-                torch.zeros((n, self.width), dtype=torch.bfloat16, device="cuda"))
+-        both = torch.empty((self.engine.world * n, self.width), dtype=torch.bfloat16, device="cuda")
++        if self.prepared is not None:
++            pieces = []
++            for k in self._items(lo, hi):
++                a, r = self.spans[k]
++                if k not in self.held:
++                    raise RuntimeError(f"picture {k}'s rows were not encoded before the chunk {start} .. "
++                                       f"{start + count} that needs them")
++                pieces.append(self.held[k][max(lo, a) - a:min(hi, a + r) - a])
++            mine = torch.cat(pieces).contiguous()
++        else:
++            mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
++                    torch.zeros((n, self.width), dtype=torch.bfloat16, device=self.device))
++        both = torch.empty((self.engine.world * n, self.width), dtype=torch.bfloat16, device=self.device)
+         self.engine.comm.all_gather(mine, both)
+-        index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device="cuda")
++        index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device=self.device)
+         return index, both[:n]
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 40e92d3..a80ce99 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -129,6 +129,16 @@ def digest(msg: Sequence[int], seq: int) -> int:
+     return (zlib.crc32(np.ascontiguousarray(msg, dtype=np.int64)) + seq * 1_000_003) % SEAL_MOD
+ 
+ 
++def picture_rows_ok(prompt: Sequence[int], positions: Sequence[int], image_token: int) -> bool:
++    """9014: every picture row of a prompt sits on the image token (a rebuilt prompt that disagreed with its layout
++    would put a picture's features in place of text)."""
++
++    if not positions:
++        return True
++    ids = prompt if isinstance(prompt, np.ndarray) else np.asarray(prompt, dtype=np.int64)
++    return bool(np.all(ids[np.asarray(positions, dtype=np.int64)] == image_token))
++
++
+ def int_array(values: Sequence[int], chunk: int = 1 << 14) -> np.ndarray:
+     """9009: ``values`` (Python ints) as an int32 array, converted in pieces of ``chunk``, so no one conversion keeps
+     the GIL for long: a request thread's work, which the engine's loop runs between."""
+@@ -872,8 +882,13 @@ class MultiDecoder:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+         hit = self._resume(key) if draft and key is not None else None
+         encoded_from = len(hit.ids) if hit is not None else 0
+-        if s.vision is not None:              # encoded before anything is sent: a failure stops here
+-            feed = self._encode(s.vision, encoded_from)
++        if s.vision is not None:              # 9014: encoded as the prefill reaches its items (``_feed_ready``)
++            image = getattr(g.vision, "image_token", None)
++            arr = getattr(s, "prompt_arr", None)
++            ids = arr if arr is not None and len(arr) == len(prompt) else prompt
++            if image is not None and not picture_rows_ok(ids, positions, image):
++                raise ValueError("a picture row of the prompt does not sit on the image token")
++            feed = self._lazy_feed(s.vision, encoded_from)
+         need = self._need(len(prompt))
+         # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
+         copy = 0
+@@ -906,8 +921,7 @@ class MultiDecoder:
+                 raise NoRoom(f"no room for a {need}-token extent in the {self.pool.rows}-token pool now")
+             copy = int(hit is not None)
+         if s.vision is not None and hit is None and encoded_from:
+-            feed = None                       # (its rows freed before the tower runs again)
+-            feed = self._encode(s.vision, 0)  # the kept state was given up: every picture, from the prompt's start
++            feed = self._lazy_feed(s.vision, 0)   # the kept state was given up: every picture, from the start
+         positions = feed.positions if feed is not None else []
+         cut = len(hit.ids) if hit is not None else 0
+         shared: list[int] = []
+@@ -937,9 +951,9 @@ class MultiDecoder:
+         self.lanes[sid].key = key
+         self.lanes[sid].inherit = self._turn_inherit(hit, prompt) if hit is not None else None
+ 
+-    def _encode(self, prepared, cut: int):
+-        """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
+-        it), as a VisionFeed; None when the kept state already holds them all."""
++    def _lazy_feed(self, prepared, cut: int):
++        """9014, rank 0: the feed of a prompt resumed at ``cut``: the items whose rows end past it, encoded by ``ensure``
++        as the prefill reaches them; None when the kept state holds them all."""
+ 
+         from .engine import VisionFeed
+ 
+@@ -954,17 +968,24 @@ class MultiDecoder:
+                 return None
+             prepared = prepared.from_item(first)
+         positions = [int(p) for p in prepared.positions]
+-        if not positions:
+-            return None
+-        t = time.perf_counter()
+-        torch.cuda.empty_cache()
+-        rows = self.g.vision.features(prepared)
+-        torch.cuda.empty_cache()
+-        if rows.shape[0] != len(positions):
+-            raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
+-        feed = VisionFeed(self.g, positions, rows)
+-        feed.encode_s = time.perf_counter() - t
+-        return feed
++        return VisionFeed(self.g, positions, None, prepared=prepared) if positions else None
++
++    def _feed_ready(self, lane, stop: int) -> list:
++        """9014, rank 0: the pictures the lane's next chunk covers, encoded before its FILL goes out. A failure fails
++        that stream alone, finished as a cancelled one is, before rank 1 hears of the chunk."""
++
++        feed = getattr(lane, "feed", None)
++        if feed is None or getattr(feed, "prepared", None) is None:
++            return []
++        try:
++            feed.ensure(lane.st.pos, stop - lane.st.pos)
++        except Exception as exc:                 # noqa: BLE001  (that stream fails; the engine serves on)
++            lane.s.error, lane.s.done = exc, True
++            lane.s.started = lane.s.finished = time.perf_counter()
++            return [lane.s]
++        lane.s.glm_lane = {**(getattr(lane.s, "glm_lane", None) or {}), "encode_s": round(feed.encode_s, 3),
++                           "pictures_encoded": feed.items_encoded}
++        return []
+ 
+     @staticmethod
+     def _parse_admit(p: list[int]) -> dict:
+@@ -1822,6 +1843,10 @@ class MultiDecoder:
+             return self._part_iteration()
+         group = self._group(lane) if lane is not None and self.group else None
+         busy = any(l.decoding and not l.s.done and not l.paused for l in self.lanes.values())
++        if lane is not None and group is None:
++            failed = self._feed_ready(lane, self._stop(lane))     # 9014: before rank 1 hears of the chunk
++            if failed:
++                return failed
+         if lane is not None and busy and self.fill_budget and lane.head is None:
+             self.partial = sliced_fill.PendingFill(group if group is not None else [(lane, self._stop(lane))],
+                                                   many=group is not None)
+@@ -2065,6 +2090,8 @@ class MultiDecoder:
+                 if layers is None:
+                     out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+                                         feed=lane.feed, mtp=False, head=stop == n)
++                    if lane.feed is not None and getattr(lane.feed, "prepared", None) is not None:
++                        lane.feed.release(stop)            # 9014: the items the prefill has passed
+                 else:
+                     complete, out = sliced_fill.advance(self.partial, *layers, len(self.w.layers),
+                         lambda: prefill_chunk_steps(e, prompt, start, stop - start,
+@@ -2072,6 +2099,8 @@ class MultiDecoder:
+                         before_finalize=self.partial.layer_event.record)
+                     if not complete:
+                         return None
++                    if lane.feed is not None and getattr(lane.feed, "prepared", None) is not None:
++                        lane.feed.release(stop)            # 9014: after the chunk's last slice
+             if stop < n:
+                 if stop in lane.stops:
+                     self._keep(lane, stop, own=stop == lane.point)
+@@ -2098,6 +2127,7 @@ class MultiDecoder:
+         s = lane.s
+         prompt = s.prompt
+         lane.decoding = True
++        lane.feed = None                         # 9014: the prompt is in: its picture rows go (both ranks)
+         s.started = time.perf_counter()
+         if lane.policy is not None and self.g.copy is not None:
+             c = self.g.copy                 # no pads: batched windows are not the single-stream widths
+@@ -2362,16 +2392,17 @@ class MultiDecoder:
+         lane.s.finished = lane.s.finished or time.perf_counter()
+ 
+     def _give_back(self) -> list[Stream]:
+-        """Rank 0: the youngest stream (one without a grammar or images, which cannot replay) leaves its slot and
+-        extent and returns to the queue; it replays later, its sent tokens owed, not sent again. If every stream has
+-        a grammar or images, the youngest fails instead (returned, to be finished)."""
++        """Rank 0: the youngest stream (one without a grammar, which cannot replay) leaves its slot and extent and
++        returns to the queue; it replays later, its sent tokens owed, not sent again (9014: with its pictures, which it
++        encodes again as its prefill reaches them). If every stream has a grammar, the youngest fails instead
++        (returned, to be finished)."""
+ 
+         lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
+-        lane = next((l for l in lanes if l.constraint is None and not l.images), None)
++        lane = next((l for l in lanes if l.constraint is None), None)
+         if lane is None:
+             lane = lanes[0]
+             lane.s.error = NoRoom("the pool is full: every stream waits for room, and the youngest cannot replay "
+-                                  "(a grammar or images)")
++                                  "(a grammar)")
+             lane.s.done = True
+             return [lane.s]
+         for c in list(lane.extent.kept):
+@@ -2747,6 +2778,9 @@ class GlmScheduler(Scheduler):
+                 continue
+             again = stream.continued()
+             again.glm = getattr(stream, "glm", {})
++            again.vision = stream.vision                 # 9014: a picture stream replays with its pictures
++            if getattr(stream, "prompt_arr", None) is not None:
++                again.prompt_arr = stream.prompt_arr
+             self.yields += 1
+             self.waiting.put((again, box))
+         self.decoder.requeue = []

@@ -22,6 +22,7 @@ NOTICE asks, this file states what the fork adds.
 | `9011-mgllm-spill-ids` | The spill tier stores a prompt's token ids as bytes, not a JSON list | this fork | File format `tensorfold-cuda-spill-3`: files of the old format are not read. Test: `tests/test_9011_spill_ids.py` |
 | `9012-mgllm-copy-drafts-start` | A stream's copy drafter starts from the prompt array the request thread made | this fork | Test: `tests/test_9012_copy_drafts_start.py` |
 | `9013-mgllm-picture-layout` | A picture is laid out the same way whatever comes after it (its size no longer depends on how many pictures the request carries), with an identity of its exact pixels; no picture count limit (the model has none), a request-size setting instead (`TENSORFOLD_MAX_BODY_MIB`, default 96) on every route that takes pictures | this fork | Past 8 pictures each new one re-sized every earlier one, so a screenshot conversation lost its saved state on every turn. The picture caches are locked, base64 is decoded in pieces, the first resize runs at start. Test: `tests/test_9013_picture_layout.py` |
+| `9014-mgllm-picture-feed` | Pictures run through the vision tower as the prompt's read reaches them, between rounds, one chunk's pictures at a time, and are let go once read | this fork | A failed encode fails that request alone; a picture request can be handed back when the pool is full. Test: `tests/test_9014_picture_feed.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
