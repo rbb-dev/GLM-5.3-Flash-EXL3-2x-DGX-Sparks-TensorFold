@@ -29,6 +29,69 @@ NOTICE asks, this file states what the fork adds.
 
 Each patch file begins with a header that explains it in full, credits included.
 
+## Measured on two DGX Sparks
+
+Two DGX Sparks: v1.10 (`tensorfold-glm53:v0.6.0-mia-a1897d591f70`) against v1.10 + fork (`tensorfold-glm53:v0.6.0-mgllm-67e2b6640113`), one after the other, with the same settings and the same conversations (`tools/resume_bench.py --seed 20261008`), from another machine on the network: 6 requests at once; a 1,048,576-token window; 2,048 tokens a picture; GPU clocks locked at 0,2200 MHz; KV pool 2,109,440 and 2,158,592 tokens. Sampling: temperature 1.0, top_p 0.95, reasoning effort max.
+
+**The Sparks**, before the tests:
+
+|  | v1.10, spark 1 | v1.10, spark 2 | v1.10 + fork, spark 1 | v1.10 + fork, spark 2 |
+| --- | --- | --- | --- | --- |
+| GPU clock / temperature | 2190 MHz / 52 C | 2177 MHz / 53 C | 2190 MHz / 53 C | 2177 MHz / 53 C |
+| CPU clock / temperature | 2668-3915 MHz / 54.3-56.9 C | 2654-3898 MHz / 56.4-59.0 C | 2651-3919 MHz / 56.7-58.9 C | 2678-3900 MHz / 55.7-58.5 C |
+| memory available | 11.2 GiB | 13.0 GiB | 11.0 GiB | 12.5 GiB |
+| driver / kernel | 580.173.02 / 6.17.0-1029-nvidia | 580.173.02 / 6.17.0-1029-nvidia | 580.173.02 / 6.17.0-1029-nvidia | 580.173.02 / 6.17.0-1029-nvidia |
+
+**Picking up a conversation** (the client sends the conversation back without the model's thinking, as agent clients and gateways do). Time to first token of the next turn:
+
+| Next turn | v1.10 | v1.10 + fork |
+| --- | ---: | ---: |
+| First read, nothing cached | 150.7 s | 150.8 s |
+| Agent with a tool call, hot (engine running) | 1.16 s | 1.13 s |
+| Agent with a tool call, cold (after a restart, from the SSD) | 150.2 s | **1.15 s** |
+| Plain chat, hot | 1.04 s | 0.97 s |
+| Plain chat, cold | 1.43 s | 0.93 s |
+
+Every resumed reply was token for token the reply of a fresh read.
+
+**A screenshot conversation** (a new 1080p screenshot every turn, the thinking dropped by the client). Time to first token, and the prompt tokens reused from the cache:
+
+| Turn | Screenshots | v1.10: first token | v1.10: reused | v1.10 + fork: first token | v1.10 + fork: reused |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 2.75 s | 0 | 1.89 s | 0 |
+| 2 | 2 | 3.06 s | 2,048 | 3.01 s | 2,048 |
+| 3 | 3 | 2.70 s | 4,224 | 2.33 s | 4,416 |
+| 4 | 4 | 2.73 s | 6,400 | 2.77 s | 6,784 |
+| 5 | 5 | 2.85 s | 8,576 | 2.42 s | 9,152 |
+| 6 | 6 | 2.86 s | 10,752 | 2.92 s | 11,392 |
+| 7 | 7 | 2.74 s | 12,928 | 2.73 s | 13,696 |
+| 8 | 8 | 2.90 s | 15,104 | 2.86 s | 16,000 |
+| 9 | 9 | **13.9 s** | **0** | 2.43 s | 18,304 |
+| 10 | 10 | **14.0 s** | **0** | 2.85 s | 20,544 |
+| 11 | 11 | **14.1 s** | **0** | 2.47 s | 22,848 |
+| 12 | 12 | **13.7 s** | **0** | 2.92 s | 25,088 |
+| 13, cold (after a restart) | 13 | 14.5 s | 0 | **3.15 s** | 27,392 |
+
+From the 9th screenshot, TensorFold shares one picture budget across the request, so every earlier screenshot shrinks and nothing matches the cache. With this fork, each picture keeps its size, and every turn resumes.
+
+**Other replies while a request arrives** (one reply streams while another request arrives; the streaming reply's longest wait between two tokens, and its rate, in the 10 s after the arrival):
+
+| Request arriving | v1.10: longest wait | v1.10: rate | v1.10 + fork: longest wait | v1.10 + fork: rate |
+| --- | ---: | ---: | ---: | ---: |
+| 1,021,598 tokens of text | 1.91 s | 8.0 tok/s | **0.18 s** | 21.7 tok/s |
+| 16 new screenshots | 2.53 s | 13.9 tok/s | **0.20 s** | 16.2 tok/s |
+
+The recipe lays those 16 screenshots out at half size (16,205 tokens, against 32,717 with this fork, each at its full size).
+
+**Engine start** (from the start command to the first one-token reply):
+
+| Start | v1.10 | v1.10 + fork |
+| --- | ---: | ---: |
+| Kernels compiled at this start | 297.4 s | 305.9 s |
+| Kernels cached | 126.9 s | 126.1 s |
+
+The full reports, every step and the settings of both runs: [`results/2026-10-08/`](results/2026-10-08/)
+
 ## Numbering
 
 - The recipe numbers its patches from `0001` upwards. This fork's own patches start at `9001`. A new recipe release
