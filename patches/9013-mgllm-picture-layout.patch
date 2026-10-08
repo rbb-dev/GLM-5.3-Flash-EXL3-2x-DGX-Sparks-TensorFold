@@ -1,0 +1,550 @@
+# A picture is laid out the same way whatever comes after it. Its cap depended on how many pictures (clips) the request
+# carried: past 8 pictures or 2 clips each new one re-sized every earlier one, so its rows and key changed and the whole
+# conversation stopped matching its saved state from its first picture on, for every client, on every turn of a
+# screenshot loop (1080p: 2,040 rows at 8 pictures, 1,792 at 9, 312 at 50). Now the request budgets default to the count
+# limits times the caps, so they never divide (setting TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS or ..._VIDEO_TOKENS shares
+# again, by choice); the picture cap itself stays a setting (TENSORFOLD_GLM_IMAGE_TOKENS, the model's own maximum is
+# 8,000). The picture count has no cap of its own (the model has none; was 50): pictures share the request's size limit,
+# now a setting (TENSORFOLD_MAX_BODY_MIB, default 96). A request too long for the window at full size is laid out once
+# more with the old shared budgets (other canvases: a plain miss), and is refused only if that does not fit either.
+# Each picture's and clip's identity (32 bytes) covers the vision code itself (VISION_ID: the spill tier's build id
+# skips tensorfold/vision), its kind, canvas shape and pixels, and a clip's frame-pair times (two clips of the same
+# frames at other times shared a key); its first 62 bits are its key, and GlmPrepared carries item_idents and
+# item_seconds. The picture caches are locked (concurrent requests crashed: "OrderedDict mutated during iteration"), a
+# canvas is read once, and a dropped canvas fitted again must give the pixels it was keyed by (else it leaves the cache
+# and the request fails, so a retry reads it fresh). The first resize after start, which held the GIL 76-119 ms on an
+# x86 core while loading kernels, runs at start (warm_fit); a picture's base64 is decoded in 1 MiB pieces (10 MiB in one
+# call held the GIL 10.5 ms). mgllm, 2026-10-08.
+# Tests: tests/test_9013_picture_layout.py (CPU; needs TF_GLM_TEST_MODEL_DIR and torchvision).
+
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 5b48deb..48fc02a 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -12,7 +12,7 @@ from tensorfold.server import anthropic, metrics, responses
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.http import Server
+-from tensorfold.server.request_body import read_body
++from tensorfold.server.request_body import max_body_bytes, read_body   # 9013: one limit, every route
+ from tensorfold.server.stacks import Rearming
+ 
+ if TYPE_CHECKING:
+@@ -108,8 +108,8 @@ def make_handler(app: App):
+                 self._discard_body()
+                 return self._json(404, {"error": "not found"})
+             try:
+-                # up to 50 pictures or 4 clips as data URLs; Content-Length or chunked (patch 0094)
+-                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")
++                # pictures and clips as data URLs, Content-Length or chunked (patch 0094); the limit is a setting (9013)
++                body = json.loads(read_body(self, limit=max_body_bytes()) or b"{}")
+             except RequestError as exc:
+                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+             except (json.JSONDecodeError, UnicodeDecodeError):
+diff --git tensorfold/server/anthropic.py tensorfold/server/anthropic.py
+index f21ecdc..4135dc6 100644
+--- tensorfold/server/anthropic.py
++++ tensorfold/server/anthropic.py
+@@ -6,7 +6,7 @@ from typing import Any
+ 
+ from tensorfold.server.anthropic_translate import Reply, error, translate
+ from tensorfold.server.errors import CapacityError, RequestError
+-from tensorfold.server.request_body import read_body
++from tensorfold.server.request_body import max_body_bytes, read_body
+ from tensorfold.server.responses import Wire, _run_chat, _send
+ 
+ 
+@@ -67,8 +67,7 @@ def post(handler: Any, app: Any) -> None:
+ 
+     count = handler.path.split("?", 1)[0].rstrip("/").endswith("/count_tokens")
+     try:
+-        # the CUDA chat route's own limit (96 MiB: up to 50 pictures as data URLs), not the Responses route's 32 MiB
+-        raw = read_body(handler, limit=96 * 1024**2)
++        raw = read_body(handler, limit=max_body_bytes())   # 9013: the chat route's limit, a setting
+         body = json.loads(raw or b"{}")
+         chat = translate(body, count=count)
+         late_system = getattr(app, "late_system", getattr(getattr(app, "template", None), "late_system", "system"))
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index 11862e6..1724166 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -135,23 +135,34 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+         from tensorfold.vision.images import ImageSource
+ 
+         pictures = [s for s in sources if isinstance(s, ImageSource)]
+-        if hasattr(frontend, 'load_images'):              # a frontend that fits each picture as it decodes it
+-            images = frontend.load_images(pictures)
+-        else:
+-            images = load_images(pictures, limits=limits, allow_urls=allow_urls)
+-        clips = [s for s in sources if not isinstance(s, ImageSource)]
+-        if clips:
+-            if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
+-                clips = frontend.load_videos(clips)
++        clip_sources = [s for s in sources if not isinstance(s, ImageSource)]
++        prompt_text = text if text is not None else render(template)
++
++        def lay_out(shared: bool):
++            more = {'shared': True} if shared else {}
++            if hasattr(frontend, 'load_images'):          # a frontend that fits each picture as it decodes it
++                images = frontend.load_images(pictures, **more)
++            else:
++                images = load_images(pictures, limits=limits, allow_urls=allow_urls)
++            if not clip_sources:
++                return frontend.prepare(prompt_text, images, max_prompt_tokens=context_limit)
++            if hasattr(frontend, 'load_videos'):         # a frontend with its own frame sampling
++                clips = frontend.load_videos(clip_sources, **more)
+             else:
+                 from tensorfold.vision.videos import load_videos
+ 
+-                clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+-            prepared = frontend.prepare(text if text is not None else render(template), images, videos=clips,
+-                                        max_prompt_tokens=context_limit)
+-        else:
+-            prepared = frontend.prepare(text if text is not None else render(template), images,
+-                                        max_prompt_tokens=context_limit)
++                clips = load_videos(clip_sources, frontend.video_size, allow_urls=allow_urls)
++            return frontend.prepare(prompt_text, images, videos=clips, max_prompt_tokens=context_limit)
++
++        try:
++            prepared = lay_out(False)
++        except ValueError as exc:
++            from tensorfold.server.errors import CONTEXT_LIMIT
++
++            # 9013: past the window at full size: the budget shared as before (other canvases: a plain miss)
++            if CONTEXT_LIMIT not in str(exc) or not getattr(frontend, 'shares_on_overflow', False):
++                raise
++            prepared = lay_out(True)
+     except (ImageInputError, ValueError, ImportError) as exc:
+         raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
+     finally:
+diff --git tensorfold/server/request_body.py tensorfold/server/request_body.py
+index 075c6c8..968ac96 100644
+--- tensorfold/server/request_body.py
++++ tensorfold/server/request_body.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ from typing import Any
+ 
+@@ -11,6 +12,17 @@ LIMIT = 32 * 1024**2
+ _METADATA_LIMIT = 65536
+ 
+ 
++def max_body_bytes() -> int:
++    """9013: the body limit of every route that takes pictures (chat, Anthropic Messages, Responses):
++    TENSORFOLD_MAX_BODY_MIB, 1 to 4,096, default 96. Pictures and clips come in the body as data URLs and share it (no
++    picture count cap), and its JSON is parsed holding the GIL (about 0.9 ms a MiB on an x86 core, measured)."""
++
++    raw = os.environ.get("TENSORFOLD_MAX_BODY_MIB", "").strip()
++    if raw and not (raw.isdecimal() and 1 <= int(raw) <= 4096):
++        raise ValueError(f"TENSORFOLD_MAX_BODY_MIB: 1 to 4,096, not {raw!r}")
++    return (int(raw) if raw else 96) << 20
++
++
+ def read_body(handler: Any, *, limit: int = LIMIT) -> bytes:
+     """Read one fixed-length or chunked body without consuming the next request."""
+ 
+diff --git tensorfold/server/responses.py tensorfold/server/responses.py
+index 89f45bb..9b32040 100644
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
+ from typing import Any, Callable
+ 
+ from tensorfold.server.errors import RequestError
+-from tensorfold.server.request_body import read_body
++from tensorfold.server.request_body import max_body_bytes, read_body
+ from tensorfold.server.responses_translate import Reply, _id, messages, translate
+ 
+ LIMIT = 32 * 1024**2
+@@ -183,7 +183,7 @@ def post(handler: Any, app: Any) -> None:
+ 
+     store = store_for(app)
+     try:
+-        data = read_body(handler, limit=LIMIT)        # Content-Length or chunked (patch 0094)
++        data = read_body(handler, limit=max_body_bytes())   # Content-Length or chunked (0094); 9013: the setting
+         try:
+             body = json.loads(data or b"{}")
+         except (ValueError, UnicodeDecodeError):
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index c346e0c..24805b6 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -15,6 +15,7 @@ import io
+ import json
+ import math
+ import os
++import threading
+ import time
+ from collections import OrderedDict
+ from dataclasses import dataclass, field, replace
+@@ -58,6 +59,25 @@ PASS_PATCHES = 8192                  # patches the tower encodes at once (its wo
+                                      # 2,048-token picture is one pass
+ 
+ 
++# 9013: the vision code's own identity, inside every picture's: a change to the tower, its pass size, the resize or the
++# layout makes stored picture states miss (the spill tier's build id does not cover tensorfold/vision)
++VISION_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
++
++
++def ident(kind: str, shape, data: bytes, seconds=None) -> bytes:
++    """9013: a picture's or clip's identity (32 bytes): the vision code, its kind, canvas shape and pixels, and a clip's
++    frame-pair times (which the prompt spells out). Its first 62 bits are the key prompt reuse matches by."""
++
++    head = b"tf-glm-ident-v1\0" + VISION_ID.encode() + kind.encode() + json.dumps(list(shape)).encode()
++    if seconds is not None:
++        head += json.dumps([round(float(t), 6) for t in seconds]).encode()
++    return hashlib.sha256(head + b"\0" + data).digest()
++
++
++def key_of(ident_: bytes) -> int:
++    return int.from_bytes(ident_[:8], "big") >> 2
++
++
+ def _env_int(name: str, default: int, low: int, high: int) -> int:
+     value = os.environ.get(name, "")
+     if value == "":
+@@ -77,6 +97,8 @@ PICTURE_CACHE = os.environ.get("TENSORFOLD_GLM_PICTURE_CACHE", "1").strip().lowe
+ PICTURE_CACHE_MB = _env_int("TENSORFOLD_GLM_PICTURE_CACHE_MB", 384, 16, 8192)
+ PICTURE_CANVASES = _env_int("TENSORFOLD_GLM_PICTURE_CANVASES", 8, 0, 64)
+ PICTURE_UNCAPPED = 8 * 1024 * 1024        # a decode with less room than this was squeezed; not worth remembering
++LEGACY_IMAGE_BUDGET = 16384               # 9013: the shared budgets of before, for a request too long at full size
++LEGACY_VIDEO_BUDGET = 32768
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -84,19 +106,22 @@ class GlmVisionLimits:
+     """Token caps: the checkpoint allows 8,000 tokens a picture and 240,000 a clip; these keep a request's
+     encode within the tower's reserved workspace and the prompt within a sensible share of the window.
+ 
+-    A request takes up to ``max_images`` pictures and ``max_videos`` clips. Its pictures share
+-    ``request_image_tokens`` and its clips ``request_video_tokens`` in equal parts, each still within its own cap:
+-    up to 8 pictures and 2 clips (the defaults) keep their full caps, so their canvases and bits are as before."""
++    9013: a picture's or clip's cap never depends on how many others the request carries (a new screenshot would
++    re-size every earlier one, so a conversation stopped matching its saved state from its first picture on): the
++    request budgets default to the count limits times the caps, so they never divide. Setting
++    TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS or ..._VIDEO_TOKENS shares that budget in equal parts again, by choice. The
++    picture count has no cap of its own (the model has none): a request's pictures share its size limit
++    (``server.request_body.max_body_bytes``) and the context window."""
+ 
+     image_tokens: int = 2048         # a picture's tokens at most (a 1080p frame is 2,040 at 2,048)
+     video_tokens: int = 16384        # a clip's tokens at most, over all its frame pairs
+     video_frames: int = 128          # frames sampled from a clip at most (2 a second, spread wider past this)
+     fps: float = 2.0                 # the processor's rate
+     min_tokens: int = 16
+-    max_images: int = 50             # pictures a request
++    max_images: int = 100_000        # pictures a request (9013: no cap of its own; was 50)
+     max_videos: int = 4              # clips a request
+-    request_image_tokens: int = 16384    # a request's pictures' tokens, shared
+-    request_video_tokens: int = 32768    # a request's clips' tokens, shared
++    request_image_tokens: int = 0    # a request's pictures' tokens, shared (9013: 0, never shared)
++    request_video_tokens: int = 0    # a request's clips' tokens, shared (9013: 0, never shared)
+ 
+     @classmethod
+     def from_env(cls) -> "GlmVisionLimits":
+@@ -104,7 +129,7 @@ class GlmVisionLimits:
+         return cls(image_tokens=_env_int("TENSORFOLD_GLM_IMAGE_TOKENS", d.image_tokens, 16, 8000),
+                    video_tokens=_env_int("TENSORFOLD_GLM_VIDEO_TOKENS", d.video_tokens, 64, 240000),
+                    video_frames=_env_int("TENSORFOLD_GLM_VIDEO_FRAMES", d.video_frames, 2, 2048),
+-                   max_images=_env_int("TENSORFOLD_GLM_MAX_IMAGES", d.max_images, 1, 256),
++                   max_images=_env_int("TENSORFOLD_GLM_MAX_IMAGES", d.max_images, 1, 1_000_000),
+                    max_videos=_env_int("TENSORFOLD_GLM_MAX_VIDEOS", d.max_videos, 1, 16),
+                    request_image_tokens=_env_int("TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS", d.request_image_tokens,
+                                                  16, 262144),
+@@ -114,12 +139,14 @@ class GlmVisionLimits:
+     def picture_tokens(self, pictures: int) -> int:
+         """Each picture's token cap in a request with ``pictures`` of them."""
+ 
+-        return max(self.min_tokens, min(self.image_tokens, self.request_image_tokens // max(1, pictures)))
++        budget = self.request_image_tokens or self.max_images * self.image_tokens      # 9013: 0 never shares
++        return max(self.min_tokens, min(self.image_tokens, budget // max(1, pictures)))
+ 
+     def clip_tokens(self, clips: int) -> int:
+         """Each clip's token cap in a request with ``clips`` of them."""
+ 
+-        return max(64, min(self.video_tokens, self.request_video_tokens // max(1, clips)))
++        budget = self.request_video_tokens or self.max_videos * self.video_tokens      # 9013: 0 never shares
++        return max(64, min(self.video_tokens, budget // max(1, clips)))
+ 
+ 
+ # -- the processors' geometry ---------------------------------------------------------------------------------
+@@ -290,20 +317,23 @@ class GlmPrepared:
+     # pictures apart by these: their placeholder tokens are all the same)
+     item_rows: list[int] = field(default_factory=list)
+     item_keys: list[int] = field(default_factory=list)
++    item_idents: list[bytes] = field(default_factory=list)   # 9013: each item's identity (``ident``)
++    item_seconds: list = field(default_factory=list)          # 9013: a clip's frame-pair times, None for a picture
+ 
+     def continued(self, ids: list[int]) -> "GlmPrepared":
+         """The same pictures under a longer prompt (a tool gate's continuation): positions are token positions."""
+ 
+         if list(ids[:len(self.token_ids)]) != list(self.token_ids):
+             raise ValueError("a continued image prompt must extend the original prompt")
+-        return GlmPrepared(list(ids), self.items, self.positions, self.content_hash, self.item_rows, self.item_keys)
++        return GlmPrepared(list(ids), self.items, self.positions, self.content_hash, self.item_rows, self.item_keys,
++                           self.item_idents, self.item_seconds)
+ 
+     def from_item(self, k: int) -> "GlmPrepared":
+         """Only items k.. and their feature rows' positions (a prompt resumed past the earlier items' rows)."""
+ 
+         skip = sum(self.item_rows[:k])
+         return GlmPrepared(self.token_ids, self.items[k:], self.positions[skip:], self.content_hash,
+-                           self.item_rows[k:], self.item_keys[k:])
++                           self.item_rows[k:], self.item_keys[k:], self.item_idents[k:], self.item_seconds[k:])
+ 
+     def keyed_ids(self) -> list[int]:
+         """The prompt's ids with each item's feature rows replaced by -1 - its key: equal prefixes then mean the same
+@@ -483,6 +513,7 @@ class FittedPicture:
+     tokens: int = 0
+     min_tokens: int = 16
+     canvas: Any = None
++    ident: bytes = b""                 # 9013: its identity (``ident``); ``key`` is its first 62 bits
+ 
+ 
+ class GlmVision:
+@@ -491,6 +522,8 @@ class GlmVision:
+ 
+     videos = True
+     tool_media = True       # tool results' pictures and clips, rendered inside their <tool_response> (issue #28)
++    shares_on_overflow = True    # 9013: past the window at full size, the request budget is shared as before
++    _cache_lock = threading.RLock()  # 9013: the picture caches, shared by request threads and the tower's worker
+ 
+     def __init__(self, model_dir: Path, device, *, allow_urls: bool = False,
+                  limits: GlmVisionLimits | None = None) -> None:
+@@ -518,7 +551,9 @@ class GlmVision:
+         n = self.limits.max_images
+         if n <= D.max_images:
+             return replace(D, max_images=n)
+-        return replace(D, max_images=n, max_total_encoded_bytes=64 * 1024 * 1024,
++        from tensorfold.server.request_body import max_body_bytes
++
++        return replace(D, max_images=n, max_total_encoded_bytes=max_body_bytes(),   # 9013: the request's own limit
+                        max_total_pixels=max(D.max_total_pixels, n * 8 * 1024 * 1024),
+                        total_timeout_seconds=max(D.total_timeout_seconds, 2.0 * n))
+ 
+@@ -526,7 +561,7 @@ class GlmVision:
+     def max_videos(self) -> int:
+         return self.limits.max_videos
+ 
+-    def load_images(self, sources) -> list:
++    def load_images(self, sources, shared: bool = False) -> list:
+         """The request's pictures, each decoded and fitted to its canvas (uint8 [3, H, W]) in turn.
+ 
+         A picture whose bytes, detail and token budget were seen before is not read again: what reading it cost is
+@@ -539,7 +574,9 @@ class GlmVision:
+         L = self.image_limits
+         if len(sources) > L.max_images:
+             raise ImageInputError(f"a request supports at most {L.max_images} images")
+-        tokens = self.limits.picture_tokens(len(sources))
++        n = max(1, len(sources))
++        tokens = (max(self.limits.min_tokens, min(self.limits.image_tokens, LEGACY_IMAGE_BUDGET // n)) if shared
++                  else self.limits.picture_tokens(len(sources)))
+         total_bytes, total_pixels, out = 0, 0, []
+         deadline = time.monotonic() + L.total_timeout_seconds
+         for source in sources:
+@@ -556,9 +593,11 @@ class GlmVision:
+             total_bytes += len(data)
+             budget = L.max_total_pixels - total_pixels
+             key = (hashlib.sha256(data).digest(), source.detail, int(tokens), self.limits.min_tokens)
+-            seen = self._pictures.get(key) if PICTURE_CACHE else None
++            with self._cache_lock:                          # 9013: another request may evict between the two
++                seen = self._pictures.get(key) if PICTURE_CACHE else None
++                if seen is not None:
++                    self._pictures.move_to_end(key)
+             if seen is not None:
+-                self._pictures.move_to_end(key)
+                 total_pixels += seen.pixels
+                 out.append(seen)
+             else:
+@@ -576,18 +615,18 @@ class GlmVision:
+         canvas = self._picture(decoded, tokens)
+         if not PICTURE_CACHE:
+             return canvas                     # off: the fitted canvas, exactly the path before this cache existed
+-        head = b"image" + json.dumps(list(canvas.shape)).encode()
+         raw = canvas.numpy().tobytes()
+-        seen = FittedPicture(rows=canvas.shape[1] // 28 * (canvas.shape[2] // 28),
+-                             key=int.from_bytes(hashlib.sha256(head + b"\0" + raw).digest()[:8], "big") >> 2,
++        made = ident("image", canvas.shape, raw)                         # 9013
++        seen = FittedPicture(rows=canvas.shape[1] // 28 * (canvas.shape[2] // 28), key=key_of(made), ident=made,
+                              shape=tuple(canvas.shape), pixels=int(decoded.width) * int(decoded.height),
+                              digest=hashlib.sha256(raw).digest(), data=data, detail=detail,
+                              tokens=int(tokens), min_tokens=self.limits.min_tokens, canvas=canvas)
+         if budget >= PICTURE_UNCAPPED:                        # a decode squeezed by the pixel budget is not kept
+-            self._pictures[key] = seen
+-            held = sum(len(x.data) for x in self._pictures.values())
+-            while held > PICTURE_CACHE_MB * 1024 * 1024 and len(self._pictures) > 1:
+-                held -= len(self._pictures.popitem(last=False)[1].data)
++            with self._cache_lock:
++                self._pictures[key] = seen
++                held = sum(len(x.data) for x in self._pictures.values())
++                while held > PICTURE_CACHE_MB * 1024 * 1024 and len(self._pictures) > 1:
++                    held -= len(self._pictures.popitem(last=False)[1].data)
+         self._hold_canvas(seen)
+         return seen
+ 
+@@ -596,12 +635,13 @@ class GlmVision:
+ 
+         if not PICTURE_CANVASES:
+             return
+-        self._canvases[seen] = True                # by the record itself: two sources can fit to the same canvas
+-        while len(self._canvases) > PICTURE_CANVASES:
+-            old = next(iter(self._canvases))
+-            del self._canvases[old]
+-            if old is not seen:
+-                old.canvas = None
++        with self._cache_lock:
++            self._canvases[seen] = True            # by the record itself: two sources can fit to the same canvas
++            while len(self._canvases) > PICTURE_CANVASES:
++                old = next(iter(self._canvases))
++                del self._canvases[old]
++                if old is not seen:
++                    old.canvas = None
+ 
+     def _canvas(self, picture: FittedPicture):
+         """A remembered picture's pixels, read again from its bytes (the tower only needs the pictures a resume did
+@@ -613,18 +653,27 @@ class GlmVision:
+         decoded = _decode(picture.data, picture.detail, L, L.max_total_pixels)
+         canvas = self._picture(decoded, picture.tokens)
+         del decoded
++        if picture.digest and hashlib.sha256(canvas.numpy().tobytes()).digest() != picture.digest:
++            with self._cache_lock:                # 9013: not the pixels it was keyed by: out of the cache, read fresh
++                for k, x in list(self._pictures.items()):
++                    if x is picture:
++                        del self._pictures[k]
++                self._canvases.pop(picture, None)
++            raise ImageInputError("a remembered picture no longer fits to the pixels it was keyed by; send it again")
+         picture.canvas = canvas
+         self._hold_canvas(picture)
+         return canvas
+ 
+-    def load_videos(self, sources) -> list[GlmClip]:
++    def load_videos(self, sources, shared: bool = False) -> list[GlmClip]:
+         from .videos import DEFAULT_VIDEO_LIMITS as L, VIDEO_MEDIA_TYPES
+         from .images import _data_bytes
+         from .images_http import fetch_image
+ 
+         if len(sources) > self.limits.max_videos:
+             raise ImageInputError(f"a request supports at most {self.limits.max_videos} videos")
+-        limits = replace(self.limits, video_tokens=self.limits.clip_tokens(len(sources)))
++        c = max(1, len(sources))
++        limits = replace(self.limits, video_tokens=max(64, min(self.limits.video_tokens, LEGACY_VIDEO_BUDGET // c))
++                         if shared else self.limits.clip_tokens(len(sources)))
+         total, out = 0, []
+         deadline = time.monotonic() + L.total_timeout_seconds
+         for source in sources:
+@@ -702,6 +751,7 @@ class GlmVision:
+                                   "(is <|image|> or <|video|> in the text?)")
+         tokens = self.limits.picture_tokens(len(images))
+         items: list[tuple[str, Any]] = []
++        seconds: list = []                      # 9013: each item's frame-pair times (None: a picture)
+         pieces: list[str] = []
+         image_iter, video_iter = iter(images), iter(videos)
+         rest = text
+@@ -719,6 +769,7 @@ class GlmVision:
+                     n = picture.shape[1] // 28 * (picture.shape[2] // 28)
+                 pieces.append(_as_text(rest[:i]) + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
+                 items.append(("image", picture))
++                seconds.append(None)
+                 rest = rest[i + len(IMAGE_SPAN):]
+             else:
+                 clip = next(video_iter)
+@@ -727,6 +778,7 @@ class GlmVision:
+                                  for s in clip.seconds)
+                 pieces.append(_as_text(rest[:v]) + "<|begin_of_video|>" + frames + "<|end_of_video|>")
+                 items.append(("video", clip.frames))
++                seconds.append(tuple(clip.seconds))
+                 rest = rest[v + len(VIDEO_SPAN):]
+         ids = encode_ids(self.tok, "".join(pieces), False)          # 9006: the GIL released
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+@@ -739,19 +791,22 @@ class GlmVision:
+         if len(positions) != rows:
+             raise ImageInputError(f"the prompt has {len(positions)} image positions for {rows} feature rows")
+         digest = hashlib.sha256(b"tensorfold-glm-vision-v1\0")
+-        keys = []
+-        for kind, x in items:
++        keys, idents = [], []
++        for (kind, x), secs in zip(items, seconds):
+             if isinstance(x, FittedPicture):                # hashed when it was read
+                 digest.update(kind.encode() + json.dumps(list(x.shape)).encode())
+                 digest.update(x.digest)
+                 keys.append(x.key)
++                idents.append(x.ident)
+                 continue
+             head = kind.encode() + json.dumps(list(x.shape)).encode()
+             data = x.numpy().tobytes()
+             digest.update(head)
+             digest.update(data)
+-            keys.append(int.from_bytes(hashlib.sha256(head + b"\0" + data).digest()[:8], "big") >> 2)
+-        return GlmPrepared(ids, items, positions, digest.hexdigest(), [self._rows(kind, x) for kind, x in items], keys)
++            idents.append(ident(kind, x.shape, data, secs))                 # 9013
++            keys.append(key_of(idents[-1]))
++        return GlmPrepared(ids, items, positions, digest.hexdigest(), [self._rows(kind, x) for kind, x in items], keys,
++                           idents, seconds)
+ 
+     @staticmethod
+     def _rows(kind: str, x) -> int:
+@@ -761,14 +816,28 @@ class GlmVision:
+     def features(self, prepared: GlmPrepared):
+         """The tower's rows for a prompt's items, fitting a remembered picture only if the tower needs its pixels."""
+ 
+-        items = [(kind, x.canvas if x.canvas is not None else self._canvas(x)) if isinstance(x, FittedPicture)
+-                 else (kind, x) for kind, x in prepared.items]
++        items = [(kind, self._held(x)) if isinstance(x, FittedPicture) else (kind, x) for kind, x in prepared.items]
+         return self.tower.features(items)
+ 
++    def _held(self, picture: FittedPicture):
++        """9013: a remembered picture's canvas, read once: another request may let it go between a check and a use."""
++
++        canvas = picture.canvas
++        return canvas if canvas is not None else self._canvas(picture)
++
++    def warm_fit(self) -> None:
++        """9013: one small resize before the first request: the first call loads torch's and torchvision's resize
++        kernels, which held the GIL 76-119 ms on an x86 core (measured), every stream waiting."""
++
++        from types import SimpleNamespace
++
++        self._picture(SimpleNamespace(pixels=bytes(3 * 60 * 100), width=100, height=60), 64)
++
+     def warm(self) -> None:
+         """Run a small picture through the tower once, so its kernels are loaded before the first request."""
+ 
+         import torch
+ 
++        self.warm_fit()
+         self.tower.features([("image", torch.zeros((3, 56, 56), dtype=torch.uint8))])
+         torch.cuda.synchronize()
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+index 1f5734d..c2697aa 100644
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -177,6 +177,17 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+     return output, sources
+ 
+ 
++def _b64_pieces(payload: str, piece: int = 1 << 20) -> bytes:
++    """9013: base64 decoded in pieces of ``piece`` characters (a multiple of 4), so no one call keeps the GIL long:
++    10 MiB in one call held it 10.5 ms on an x86 core (measured)."""
++
++    if len(payload) <= piece:
++        return base64.b64decode(payload, validate=True)
++    if len(payload) % 4:
++        raise binascii.Error("Incorrect padding")
++    return b"".join(base64.b64decode(payload[k:k + piece], validate=True) for k in range(0, len(payload), piece))
++
++
+ def _data_bytes(url: str, max_bytes: int) -> bytes:
+     header, separator, payload = url.partition(",")
+     if not separator or len(header) > 256:
+@@ -191,7 +202,7 @@ def _data_bytes(url: str, max_bytes: int) -> bytes:
+         raise ImageInputError("invalid image data URL encoding")
+     try:
+         if len(media) == 2:
+-            data = base64.b64decode(payload, validate=True)
++            data = _b64_pieces(payload)          # 9013
+         else:
+             data = unquote_to_bytes(payload)
+     except (ValueError, binascii.Error):

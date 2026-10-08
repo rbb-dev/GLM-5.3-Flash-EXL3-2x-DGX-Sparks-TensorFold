@@ -21,6 +21,7 @@ NOTICE asks, this file states what the fork adds.
 | `9010-mgllm-gc-policy` | Python's garbage collection on the engine's own schedule: a full collection only when idle (or every 15 minutes), never in the middle of streams | this fork | `TF_GLM_GC=0` leaves Python's own collection on. Test: `tests/test_9010_gc_policy.py` |
 | `9011-mgllm-spill-ids` | The spill tier stores a prompt's token ids as bytes, not a JSON list | this fork | File format `tensorfold-cuda-spill-3`: files of the old format are not read. Test: `tests/test_9011_spill_ids.py` |
 | `9012-mgllm-copy-drafts-start` | A stream's copy drafter starts from the prompt array the request thread made | this fork | Test: `tests/test_9012_copy_drafts_start.py` |
+| `9013-mgllm-picture-layout` | A picture is laid out the same way whatever comes after it (its size no longer depends on how many pictures the request carries), with an identity of its exact pixels; no picture count limit (the model has none), a request-size setting instead (`TENSORFOLD_MAX_BODY_MIB`, default 96) on every route that takes pictures | this fork | Past 8 pictures each new one re-sized every earlier one, so a screenshot conversation lost its saved state on every turn. The picture caches are locked, base64 is decoded in pieces, the first resize runs at start. Test: `tests/test_9013_picture_layout.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
@@ -54,7 +55,7 @@ patches on top.
 
 The tests in `tests/` are pytest unit tests for this fork's patches. They run on the CPU against a TensorFold v0.6.0
 source tree with all patches applied, with that tree's `src/` on `PYTHONPATH`. They need `pytest`, `prometheus_client`
-and TensorFold's own Python dependencies (a CPU build of `torch` is enough). The tests that render real GLM-5.3-Flash prompts also read its `tokenizer.json`, `chat_template.jinja` and `tokenizer_config.json` from the folder `TF_GLM_TEST_MODEL_DIR` names (a checkpoint snapshot); without it they are skipped.
+and TensorFold's own Python dependencies (a CPU build of `torch` is enough). The tests that render real GLM-5.3-Flash prompts also read its `tokenizer.json`, `chat_template.jinja` and `tokenizer_config.json` from the folder `TF_GLM_TEST_MODEL_DIR` names (a checkpoint snapshot); without it they are skipped. The picture tests also need `torchvision`.
 
 ## License
 
