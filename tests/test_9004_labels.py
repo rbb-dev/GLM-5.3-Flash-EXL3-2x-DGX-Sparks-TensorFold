@@ -26,7 +26,7 @@ TOOLS = active_tool_specs([
 @pytest.fixture(scope="module")
 def tpl():
     inner = ChatTemplate(model_dir())
-    return lambda clear=False: ThinkingOffTemplate(inner, None, clear_thinking=clear)
+    return lambda clear=False: ThinkingOffTemplate(inner, clear_thinking=clear)
 
 
 def production(t, messages, *, tools=None):
