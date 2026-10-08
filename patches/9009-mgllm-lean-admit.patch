@@ -1,0 +1,234 @@
+# A long request's admission without Python-list round trips. Rank 0 sent a request's whole prompt to rank 1 in its
+# ADMIT, and both ranks walked it as Python objects several times on their scheduler threads, where every stream's
+# decoding waits: a 1,000,000-token ADMIT kept rank 0 for 323 ms and rank 1 for 136 ms (x86 workstation, measured; a
+# GB10 core is slower). Now the request thread makes the prompt's int32 array in short pieces (submit), the ADMIT sends
+# it as one part of the message, the message is sealed as one int64 array with a CRC-32 checksum in place of the
+# position-weighted sum, rank 0 reads nothing back from its own all-gather, and rank 1 takes the message as an array and
+# each payload in one C pass: 7 ms on rank 0 and 35 ms on rank 1 for the same ADMIT (steady state, x86). The values on
+# the wire are unchanged but for the checksum, which both ranks of one build compute alike. mgllm, 2026-10-08.
+# Tests: tests/test_9009_lean_admit.py (CPU).
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 2e922d1..6f74961 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -467,6 +467,25 @@ def bell_key(rank: int, n: int) -> str:
+     return f"tf_glm_request_{n}" if rank == 1 else f"tf_glm_request_r{rank}_{n}"
+ 
+ 
++def to_wire(values):
++    """Rank 0's message as one int32 host tensor (int32 on the wire): from an array without a pass over Python
++    objects (9009), from a list as before."""
++
++    import numpy as np
++    import torch
++
++    if isinstance(values, np.ndarray):
++        return torch.from_numpy(np.ascontiguousarray(values, dtype=np.int32))
++    return torch.tensor(values, dtype=torch.int32)
++
++
++def from_wire(t, as_array: bool = False):
++    """A received message: an int64 array (``as_array``, 9009), else a list of ints, each made in one C pass."""
++
++    a = t.cpu().numpy()
++    return a.astype("int64") if as_array else a.tolist()
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on ``world`` ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -1001,19 +1020,22 @@ class GlmEngine:
+         store.delete_key(key)
+         self._bell = getattr(self, "_bell", 0) + 1
+ 
+-    def _share(self, values: list[int] | None) -> list[int]:
+-        """Rank 0's int list on every rank (a length, then the values, through the all-gather)."""
++    def _share(self, values, *, want: bool = True, as_array: bool = False):
++        """Rank 0's ints (a list, or an array: 9009) on every rank (a length, then the values, through the
++        all-gather): a list of ints, an int64 array with ``as_array``, nothing on rank 0 without ``want``."""
+ 
+         torch = self.torch
+         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
+         got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(n, got)
+         count = int(got[0].item())
+-        buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
++        buf = (to_wire(values).to("cuda") if self.rank == 0
+                else torch.zeros((count,), dtype=torch.int32, device="cuda"))
+         allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(buf, allv)
+-        return [int(v) for v in allv[:count].tolist()]
++        if self.rank == 0 and not want:
++            return None
++        return from_wire(allv[:count], as_array)
+ 
+     def _effective(self, code: list[int]) -> list[int]:
+         """Resolve auto and MTP policies to the available heads, using EXL3_AUTO for EXL3 with DFlash2 and DFlash2 when MTP is absent."""
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 8d80442..098a295 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -40,6 +40,7 @@ import os
+ import queue
+ import threading
+ import time
++import zlib
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Sequence
+ 
+@@ -112,16 +113,29 @@ def _unwatch(seconds: float) -> None:
+ SEAL_MOD = 2_147_483_647                 # a message's checksum, modulo this prime (int32 on the wire)
+ 
+ 
+-def seal(msg: Sequence[int], seq: int) -> list[int]:
+-    """Rank 0: an iteration's message with its sequence number and a checksum appended (``unseal`` on rank 1)."""
++def seal(msg: Sequence[int], seq: int) -> np.ndarray:
++    """Rank 0: an iteration's message with its sequence number and a checksum appended (``unseal`` on rank 1), as one
++    int64 array (9009): the checksum and the wire buffer take no pass over Python objects but the one that makes it."""
+ 
+-    return [*msg, seq, digest(msg, seq)]
++    a = np.asarray(msg, dtype=np.int64)
++    return np.concatenate([a, np.array([seq, digest(a, seq)], dtype=np.int64)])
+ 
+ 
+ def digest(msg: Sequence[int], seq: int) -> int:
+-    a = np.asarray(msg, dtype=np.int64) % SEAL_MOD
+-    w = np.arange(1, len(a) + 1, dtype=np.int64) % SEAL_MOD
+-    return int((int((a * w % SEAL_MOD).sum()) + seq * 1_000_003) % SEAL_MOD)
++    """A message's checksum: CRC-32 of its values as int64 (9009: a few milliseconds at 1M values, against about
++    100 ms for the position-weighted sum it replaces), mixed with its sequence number, below SEAL_MOD."""
++
++    return (zlib.crc32(np.ascontiguousarray(msg, dtype=np.int64)) + seq * 1_000_003) % SEAL_MOD
++
++
++def int_array(values: Sequence[int], chunk: int = 1 << 14) -> np.ndarray:
++    """9009: ``values`` (Python ints) as an int32 array, converted in pieces of ``chunk``, so no one conversion keeps
++    the GIL for long: a request thread's work, which the engine's loop runs between."""
++
++    out = np.empty((len(values),), dtype=np.int32)
++    for i in range(0, len(values), chunk):
++        out[i:i + chunk] = values[i:i + chunk]
++    return out
+ 
+ 
+ def unseal(msg: Sequence[int], seq: int, rank: int = 1) -> list[int]:
+@@ -132,7 +146,8 @@ def unseal(msg: Sequence[int], seq: int, rank: int = 1) -> list[int]:
+     if len(msg) < 2:
+         raise RuntimeError(f"rank {rank}: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
+                            "the ranks are out of step: restart them all")
+-    body, got_seq, got = list(msg[:-2]), int(msg[-2]), int(msg[-1])
++    body = msg[:-2] if isinstance(msg, np.ndarray) else list(msg[:-2])      # 9009: an array stays one
++    got_seq, got = int(msg[-2]), int(msg[-1])
+     if got_seq != seq or got != digest(body, got_seq):
+         raise RuntimeError(f"rank {rank}: expected rank 0's message {seq}, received number {got_seq} "
+                            f"({'checksum matches' if got == digest(body, got_seq) else 'checksum differs'}, "
+@@ -566,7 +581,7 @@ class MultiDecoder:
+         self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.next_chat = 0
+-        self.outbox: list[int] = []
++        self.outbox: list = []                           # this iteration's ops: lists of ints, arrays (9009)
+         self.idle = True
+         self.broken: Exception | None = None
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+@@ -624,9 +639,17 @@ class MultiDecoder:
+             raise RuntimeError("the two ranks are out of step after an error; restart both") from self.broken
+ 
+     # -- messages --------------------------------------------------------------------------------------------------------
+-    def _emit(self, op: int, payload: Sequence[int]) -> list[int]:
+-        payload = [int(v) for v in payload]
+-        self.outbox += [op, len(payload), *payload]
++    def _emit(self, op: int, payload: Sequence[int], trusted: bool = False, bulk=None) -> list[int]:
++        """Queue one op for rank 1. ``trusted``: the payload is a list of ints already (9009: an ADMIT's); ``bulk``:
++        (at, array), the payload's values from ``at`` on sent from that array, never walked as Python objects."""
++
++        if not trusted:
++            payload = [int(v) for v in payload]
++        if bulk is None:
++            self.outbox.append([op, len(payload), *payload])
++        else:
++            at, arr = bulk
++            self.outbox += [[op, len(payload), *payload[:at]], arr, payload[at + len(arr):]]
+         return payload
+ 
+     def _flush(self) -> None:
+@@ -635,12 +658,14 @@ class MultiDecoder:
+         if self.idle:
+             self.g._ring()
+             self.idle = False
+-        msg, self.outbox = seal(self.outbox, self.sent), []
++        body = (np.concatenate([c if isinstance(c, np.ndarray) else np.asarray(c, dtype=np.int64)
++                                for c in self.outbox]) if self.outbox else np.zeros((0,), dtype=np.int64))
++        msg, self.outbox = seal(body, self.sent), []                 # 9009: the chunks as one array
+         self.sent = (self.sent + 1) % SEAL_MOD
+         if self.tune.async_msg or (self.fill_budget and (self.partial is not None or self.short_round_due)):
+             self._send(msg)
+         else:
+-            self.g._share(msg)
++            self.g._share(msg, want=False)       # 9009: rank 0 reads nothing back
+ 
+     def _send(self, values: list[int]) -> None:
+         """Rank 0, TF_GLM_MULTI_ASYNC: ``GlmEngine._share``'s two all-gathers (the length, then the values) without
+@@ -776,7 +801,8 @@ class MultiDecoder:
+             op, n = int(msg[i]), int(msg[i + 1])
+             if op not in OPS or n < 0 or i + 2 + n > len(msg):
+                 raise RuntimeError("invalid multi-stream op or payload length")
+-            p = [int(v) for v in msg[i + 2:i + 2 + n]]
++            seg = msg[i + 2:i + 2 + n]
++            p = seg.tolist() if isinstance(seg, np.ndarray) else [int(v) for v in seg]   # 9009: one C pass
+             if op == FILLPART and (len(p) != 4 or not 0 <= p[2] < p[3]):
+                 raise RuntimeError("invalid FILLPART payload")
+             if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0]
+@@ -808,7 +834,7 @@ class MultiDecoder:
+ 
+         self._check()
+         g = self.g
+-        prompt = [int(t) for t in s.prompt]
++        prompt = s.prompt if type(s.prompt) is list else [int(t) for t in s.prompt]    # 9009: ints already
+         if not prompt:
+             raise ValueError("a request needs at least one prompt token")
+         if len(prompt) >= g.limit:
+@@ -887,15 +913,19 @@ class MultiDecoder:
+             shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
+                                    g.opener)
+         sid = self.next_sid
+-        payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+-                   int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
+-                   len(prompt), *prompt]
++        head = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
++                int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
++                len(prompt)]
+         from tensorfold.engine.grammar import pack
+ 
+         packed = pack(s.constraint)
+-        payload += [len(packed), *packed, len(positions), *positions, int(s.vision is not None),
+-                    *pack_keys(vrows, vkeys, vpos)]
+-        self._emit(ADMIT, payload)
++        tail = [len(packed), *packed, len(positions), *positions, int(s.vision is not None),
++                *pack_keys(vrows, vkeys, vpos)]
++        payload = head + prompt + tail
++        arr = getattr(s, "prompt_arr", None)          # 9009: made on the request thread (submit)
++        if arr is None or len(arr) != len(prompt):
++            arr = np.asarray(prompt, dtype=np.int32)
++        self._emit(ADMIT, payload, trusted=True, bulk=(len(head), arr))
+         try:
+             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
+         except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
+@@ -2373,7 +2403,7 @@ class MultiDecoder:
+                 self.g._await_bell()
+                 self.idle = False
+             _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
+-            self.apply(unseal(self.g._share(None), self.received, self.rank))
++            self.apply(unseal(self.g._share(None, as_array=True), self.received, self.rank))   # 9009
+             self.received = (self.received + 1) % SEAL_MOD
+             _unwatch(self.watchdog)
+             if once:
+@@ -2503,6 +2533,7 @@ class GlmScheduler(Scheduler):
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background)
+         stream.glm = dict(glm or {})
++        stream.prompt_arr = int_array(stream.prompt)  # 9009: the ADMIT sends it, with no pass over Python objects
+         # The caller polls; only the scheduler removes cancelled queued requests.
+         stop, disconnected, cancel_error = [False], [False], [None]
+         poll = getattr(emit, "cancelled", None)

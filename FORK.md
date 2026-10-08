@@ -17,6 +17,7 @@ NOTICE asks, this file states what the fork adds.
 | `9006-mgllm-unlocked-tokenize` | Prompts tokenized with Python's lock released: text prompts, picture prompts and a resumed request's new part alike, so a long request's tokenization no longer pauses every other request's stream | this fork | The same token ids. Test: `tests/test_9006_unlocked_tokenize.py` |
 | `9007-mgllm-no-kept-reasoning` | Mia's in-RAM reasoning memory (0036's KeptReasoning) cut out: reasoning a client dropped comes back only through a turn record (9004/9005), saved, read back and evicted with its prompt state, after restarts too | this fork | The memory was a second cache with a retention of its own, and its signature ignored pictures: the same words with another picture got the first conversation's thinking. Test: `tests/test_9007_no_kept_reasoning.py` |
 | `9008-mgllm-stall-meter` | The engine's own stall meter on `/health` (`"stalls"`): every pause between two decode rounds while streams decode, what filled it (admit, round, finish, reply), and the engine's clock to place them by | this fork | Measuring only. A client sees such a pause only when it outlasts the 0.4 s stream smoothing. Test: `tests/test_9008_stall_meter.py` |
+| `9009-mgllm-lean-admit` | A long request's admission without Python-list round trips on the scheduler threads | this fork | The same values on the wire but for the message checksum (CRC-32). Test: `tests/test_9009_lean_admit.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
