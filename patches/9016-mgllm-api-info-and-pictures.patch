@@ -1,0 +1,72 @@
+# API translations. The Anthropic Messages route now carries TensorFold's info block (the reply's token checksum, the
+# record path it took, whether a record was written) on its stream's message_delta and in a non-streamed message, as the
+# chat route carries it on its last chunk: exactness can be checked on Claude Code's route too (the field is additive;
+# clients ignore what they do not read). A Responses function_call_output may carry pictures (input_image parts beside
+# input_text): its tool message then holds a part list, rendered inside its tool response as a chat tool result's
+# pictures are, and resumed from records as they are (9015); it was refused with 400. mgllm, 2026-10-08.
+# Tests: tests/test_9016_api_info_and_pictures.py (CPU).
+
+diff --git tensorfold/server/anthropic_translate.py tensorfold/server/anthropic_translate.py
+index bbb85ca..9649220 100644
+--- tensorfold/server/anthropic_translate.py
++++ tensorfold/server/anthropic_translate.py
+@@ -242,6 +242,7 @@ class Reply:
+         self.finish = "end_turn"
+         self.stop_sequence: str | None = None
+         self.tokens = usage({})
++        self.info: dict[str, Any] | None = None   # 9016: TensorFold's block on the chat stream's last chunk
+ 
+     def start(self) -> None:
+         self.send({"type": "message_start", "message": self.base})
+@@ -277,7 +278,7 @@ class Reply:
+             self.drain_calls(final=True)
+             self.close()
+             self.send({"type": "message_delta", "delta": {"stop_reason": self.finish, "stop_sequence": self.stop_sequence},
+-                       "usage": self.tokens})
++                       "usage": self.tokens, **({"tensorfold": self.info} if self.info is not None else {})})
+             self.send({"type": "message_stop"})
+             self.finished = True
+             return
+@@ -295,6 +296,8 @@ class Reply:
+                          for c in chunk["choices"]))
+         if chunk.get("usage") is not None:
+             self.tokens = usage(chunk["usage"])
++        if chunk.get("tensorfold") is not None:
++            self.info = chunk["tensorfold"]      # 9016: carried on message_delta, as the chat route carries it
+         if chunk.get("stop_sequence") is not None:
+             self.stop_sequence = chunk["stop_sequence"]
+         for choice in chunk.get("choices", []):
+@@ -366,6 +369,7 @@ class Reply:
+                 raise TypeError("model tool arguments are not a JSON object")
+             content.append({"type": "tool_use", "id": call["id"], "name": fn["name"], "input": args})
+         return {**self.base, "content": content, "usage": usage(chunk.get("usage") or {}),
++                **({"tensorfold": chunk["tensorfold"]} if chunk.get("tensorfold") is not None else {}),   # 9016
+                 "stop_sequence": chunk.get("stop_sequence"),
+                 "stop_reason": "stop_sequence" if chunk.get("stop_sequence") is not None else
+                 {"tool_calls": "tool_use", "length": "max_tokens"}.get(choice["finish_reason"], "end_turn")}
+diff --git tensorfold/server/responses_translate.py tensorfold/server/responses_translate.py
+index d1c020a..6942b87 100644
+--- tensorfold/server/responses_translate.py
++++ tensorfold/server/responses_translate.py
+@@ -55,14 +55,18 @@ def _content(content: Any) -> str | list[dict[str, Any]]:
+     return parts
+ 
+ 
+-def _output(output: Any) -> str:
+-    """A function_call_output's output as a tool message's text."""
++def _output(output: Any) -> str | list[dict[str, Any]]:
++    """A function_call_output's output as a tool message's content: its text, or (9016) a part list when it carries
++    pictures, rendered inside its tool response as a chat tool result's pictures are."""
+ 
+     if isinstance(output, str):
+         return output
+     if isinstance(output, list) and all(isinstance(p, dict) and p.get("type") == "input_text" for p in output):
+         return "".join(str(p.get("text") or "") for p in output)
+-    raise RequestError("a function_call_output's output must be a string or input_text parts")
++    if isinstance(output, list) and all(isinstance(p, dict) and p.get("type") in ("input_text", "input_image")
++                                        for p in output):
++        return _content(output)
++    raise RequestError("a function_call_output's output must be a string, or input_text and input_image parts")
+ 
+ 
+ def messages(items: list[Any]) -> list[dict[str, Any]]:
