@@ -1,0 +1,157 @@
+# The engine's stall meter: while streams decode, the time between two decode rounds is time every one of them waits.
+# It is measured on rank 0 inside the engine, because a client sees it only behind the stream smoothing, which hides
+# pauses up to about 0.4 s. Each gap is broken down by what the scheduler did in between (admit; round: a prompt chunk
+# or a spill write; finish; reply). /health's "stalls": the number of gaps, the worst, how many reached 50 ms, 100 ms,
+# 250 ms, 500 ms and 1 s, and the last 32 of 50 ms or more, each with the wall time it ended and its parts,
+# and the engine's own wall time ("now"), so a reader on another machine places each gap on its own clock.
+# mgllm, 2026-10-08.
+# Tests: tests/test_9008_stall_meter.py (CPU).
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index aab5f6b..8d80442 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -53,8 +53,11 @@ from tensorfold.cuda.streams import Stream, next_fill
+ from . import multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
++from .stall_meter import StallMeter
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
++_NO_STALLS = StallMeter()                         # 9008: a decoder without a meter (never reads a round, so no gaps)
++
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, SPILL, LOADED, \
+     TOUCH = range(1, 18)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+@@ -555,6 +558,7 @@ class MultiDecoder:
+         self.watchdog = watchdog_seconds()               # stack dumps of a stalled iteration (TF_GLM_MULTI_WATCHDOG_S)
+         watchdog_exits()                                  # TF_GLM_MULTI_WATCHDOG_EXIT read now: a typo fails at start
+         self.iteration_since = None                       # when rank 0's current iteration began (/health)
++        self.stalls = StallMeter()                        # 9008, rank 0: decoding streams' waits between rounds
+         self.sent = self.received = 0                     # messages sealed on rank 0, unsealed on rank 1
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
+@@ -607,6 +611,7 @@ class MultiDecoder:
+                                       key=lambda r: -r[1])[:8],
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                "stalls": getattr(self, "stalls", _NO_STALLS).health(),     # (a decoder built without __init__)
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
+                 "drafts": {k: {"rounds": c["rounds"], "drafted": list(c["drafted"]), "accepted": list(c["accepted"])}
+                            for k, c in list(self.draft_counts.items())},
+@@ -1838,7 +1843,10 @@ class MultiDecoder:
+         self.short_round_due = False
+         if prof is not None:
+             prof.mark("message")
++        stalls = getattr(self, "stalls", _NO_STALLS)
++        stalls.round_start()
+         self._round(active, lone=lone, short=short)
++        stalls.round_end(any(l.decoding and not l.s.done for l in self.lanes.values()))
+         return [l.s for l in active if l.s.done]
+ 
+     def _part_iteration(self) -> list[Stream]:
+@@ -2718,20 +2726,25 @@ class GlmScheduler(Scheduler):
+             time.sleep(0.002)                    # only reads in flight: poll them
+         first = self.waiting.get() if idle else None                # idle: wait for a request
+         until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
+-        done = self._admit(first, until)
++        stalls = getattr(self.decoder, "stalls", None) or _NO_STALLS     # 9008: what fills a gap between rounds
++        with stalls.phase("admit"):
++            done = self._admit(first, until)
+         try:
+-            done += self.decoder.round()
++            with stalls.phase("round"):
++                done += self.decoder.round()
+         except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+             for s in self.decoder.drop():
+                 self._reply(s, "error", exc)
+         self._requeue()
+         try:
+-            self.decoder.finish(done)
++            with stalls.phase("finish"):
++                self.decoder.finish(done)
+         except Exception as exc:                 # noqa: BLE001
+             for s in self.decoder.drop():
+                 self._reply(s, "error", exc)
+-        for s in done:
+-            self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
++        with stalls.phase("reply"):
++            for s in done:
++                self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
+         if self.held is not None and not self.decoder.live():
+             time.sleep(0)                        # the held request retries next iteration (now alone)
+         _unwatch(getattr(self.decoder, "watchdog", 0))
+diff --git tensorfold/families/glm5_next/cuda/stall_meter.py tensorfold/families/glm5_next/cuda/stall_meter.py
+new file mode 100644
+index 0000000..0bafa99
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/stall_meter.py
+@@ -0,0 +1,68 @@
++"""Patch 9008: the engine's stall meter (rank 0). While streams decode, the time between two decode rounds is time
++every one of them waits. It is measured here, inside the engine: a client sees it only behind the stream smoothing,
++which hides pauses up to about 0.4 s. Each gap is broken down by what the scheduler did in between (``phase``)."""
++
++from __future__ import annotations
++
++import threading
++import time
++from collections import deque
++from collections.abc import Callable, Generator
++from contextlib import contextmanager
++
++BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0)          # seconds: /health counts the gaps at or past each
++
++
++class StallMeter:
++    """``round_start``/``round_end`` around each decode round; ``phase(name)`` around each scheduler step between."""
++
++    def __init__(self, *, clock: Callable[[], float] = time.perf_counter, wall: Callable[[], float] = time.time,
++                 listed_s: float = 0.05, keep: int = 32) -> None:
++        self.clock, self.wall, self.listed_s = clock, wall, listed_s
++        self.last_end: float | None = None         # the last decode round's end, while streams still decode
++        self.parts: dict[str, float] = {}           # what ran since then, by phase
++        self.recent: deque = deque(maxlen=keep)     # the last gaps of ``listed_s`` or more
++        self.gaps = 0
++        self.worst = 0.0
++        self.over = {b: 0 for b in BUCKETS}
++        self.lock = threading.Lock()                # /health reads from another thread
++
++    def round_start(self) -> None:
++        now = self.clock()
++        if self.last_end is not None:
++            gap = now - self.last_end
++            parts = {k: round(v, 3) for k, v in self.parts.items() if v > 0}
++            other = gap - sum(self.parts.values())
++            if other > 0.0005:
++                parts["other"] = round(other, 3)
++            with self.lock:
++                self.gaps += 1
++                self.worst = max(self.worst, gap)
++                for b in BUCKETS:
++                    if gap >= b:
++                        self.over[b] += 1
++                if gap >= self.listed_s:
++                    self.recent.append({"gap_s": round(gap, 3), "ended": self.wall(), "parts": parts})
++        self.last_end = None
++        self.parts = {}
++
++    def round_end(self, still_decoding: bool) -> None:
++        self.last_end = self.clock() if still_decoding else None
++        self.parts = {}
++
++    @contextmanager
++    def phase(self, name: str) -> Generator[None, None, None]:
++        start = self.clock()
++        try:
++            yield
++        finally:
++            if self.last_end is not None:
++                spent = self.clock() - max(start, self.last_end)
++                if spent > 0:
++                    self.parts[name] = self.parts.get(name, 0.0) + spent
++
++    def health(self) -> dict:
++        with self.lock:
++            return {"gaps": self.gaps, "worst_s": round(self.worst, 3),
++                    "over": {f"{b:g}": n for b, n in self.over.items()}, "recent": list(self.recent),
++                    "now": round(self.wall(), 3)}     # the engine's clock: a reader elsewhere places "ended" by it
