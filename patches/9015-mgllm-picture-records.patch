@@ -1,0 +1,637 @@
+# Turn records for picture and clip conversations. A conversation with any picture or clip got no record, so after a
+# restart, or from a client that drops the thinking, it could not resume; and a screenshot tool result (a tool message
+# whose content is a part list) never got a verified start, so in a screenshot loop no turn got a label at all. Now a
+# picture request is seen through one marked render as production renders it (the media split out, a mark before each
+# picture and clip, quoted markers escaped as production escapes them; a tool result sent as a plain part list is
+# marked too) and must equal production's text; each picture's identity (9013) is hashed into the label at its place
+# (an M record after its span's text), so the same words with another picture never share a label (Mia's reasoning
+# memory gave such a conversation another's thinking). The record (r5) holds T keyed (picture rows hold -1 - their
+# key), its sha256 over int64, and a picture table (kind, rows, key); its key also carries the label without the
+# pictures, which only names a miss ("pictures differ"). On a hit the layout is rebuilt: the record's tokens plus the
+# new part laid out with the request's own new pictures and clips, after checking that the record's pictures are the
+# request's first ones (rows and keys), that T holds each at its rows, and that the new part's tokens are production's
+# own tail; the prompt and the layout go to the engine together. The engine compares keyed tails when a request
+# inherits its state's record. A reply that writes a picture or clip marker keeps no record. Measured on the CPU with the
+# real template, tokenizer and picture frontend: every turn of an 11-turn 1080p screenshot loop past its 8th picture,
+# picture and clip conversations in memory and after a restart, and the Anthropic and Responses routes are served their
+# records, token for token what a fresh read of the true conversation prefills. mgllm, 2026-10-08.
+# Tests: tests/test_9015_picture_records.py (CPU; needs TF_GLM_TEST_MODEL_DIR, torchvision and PyAV).
+
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 9a85fb3..802f66a 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -238,7 +238,8 @@ class App:
+                                           context_limit=self._context_limit())
+                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+-                                       vision=rendered.vision, grammar=compiled, think_budget=budget)
++                                       vision=rendered.vision, grammar=compiled, think_budget=budget,
++                                       text=rendered.text, template_kwargs=kwargs)     # 9015: a picture view
+             else:
+                 text = render(body["messages"])
+                 plain = text
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 0575be3..f44dae2 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -35,13 +35,15 @@ class ThinkingOffTemplate:
+             text = effort_to_tail(text, bool(enable_thinking))
+         return text if enable_thinking else thinking_off(text)
+ 
+-    def render_marked(self, messages, *, tools, extra=None, marks) -> tuple[str, list]:
++    def render_marked(self, messages, *, tools, extra=None, marks, allow_images: bool = False) -> tuple[str, list]:
+         """9004: a thinking request's render with ``marks`` (``labels.Marks``) placed after the history is made
+-        renderable and before the template runs, and the messages they index (``labels.analyse`` takes both)."""
++        renderable and before the template runs, and the messages they index (``labels.analyse`` takes both);
++        9015: ``allow_images`` for a request with pictures or clips (their parts split out, as production renders)."""
+ 
+         extra = {"clear_thinking": self.clear_thinking, **(extra or {})}
+         history = agent_history(messages)
+-        return self.inner.render(marks.apply(history), tools=tools, enable_thinking=True, extra=extra), history
++        return self.inner.render(marks.apply(history), tools=tools, enable_thinking=True, extra=extra,
++                                 allow_images=allow_images), history
+ 
+ 
+ # the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+@@ -109,7 +111,7 @@ class GlmApp(App):
+         if chat and self.label_ns is not None:
+             try:
+                 prepared.resume = turn_records.view(self.template, body, prepared, self.label_ns,
+-                                                    self.template.clear_thinking)
++                                                    self.template.clear_thinking, frontend=self.vision)
+             except Exception as exc:             # noqa: BLE001
+                 prepared.resume = f"error: {exc!r}"
+             return self._resumed(body, prepared)
+@@ -129,7 +131,8 @@ class GlmApp(App):
+             self.record_counts["miss: " + (v if isinstance(v, str) else v.reason).split(":")[0]] += 1
+             return prepared
+         hit = dataclasses.replace(prepared, prompt=v.context, sampling=self.sampling_for(body, v.context),
+-                                  max_tokens=self._requested_tokens(body))
++                                  max_tokens=self._requested_tokens(body),
++                                  vision=v.hit_vision if v.hit_vision is not None else prepared.vision)    # 9015
+         if self.check(body, prepared=hit) is not None:      # never refuse what today's render would serve
+             v.hit, v.context, v.reason = None, None, "context limit"
+             self.record_counts["miss: context limit"] += 1
+@@ -206,7 +209,11 @@ class GlmApp(App):
+                 ignore_eos=prepared.ignore_eos, kwargs=body.get("chat_template_kwargs"),
+                 pictures=prepared.vision is not None, result=result, out=out,
+                 think_close=self.tok.token_to_id("</think>"), call_open=self.tok.token_to_id("<tool_call>"),
+-                runs=int(holder.get("runs") or 0))
++                runs=int(holder.get("runs") or 0), media_tokens=self._media_tokens())
++            vision = prepared.vision
++            if why is None and vision is not None and not (getattr(vision, "item_idents", None) and
++                                                           sum(vision.item_rows) == len(vision.positions)):
++                why = "picture without key"
+             if why is None and not isinstance(v, View):
+                 why = v if isinstance(v, str) else "no view"
+             state = None
+@@ -217,13 +224,17 @@ class GlmApp(App):
+                     if kid is not None else None
+                 why = None if state is not None else "no own state" if kid is None else "state gone"
+             if why is None:
+-                T = list(prepared.prompt) + list(out[:-1])
++                keyed = vision.keyed_ids() if vision is not None else None          # 9015: T keyed
++                T = list(keyed if keyed is not None else prepared.prompt) + list(out[:-1])
+                 if not turn_records.continues(state, T):
+                     why = "another branch's record"
+                 else:
++                    pics = ([[kind, int(r), int(k)] for (kind, _), r, k in zip(vision.items, vision.item_rows,
++                                                                               vision.item_keys)]
++                            if vision is not None else None)
+                     made = turn_records.make_record(self.template, v, result, prompt=prepared.prompt, out=out,
+                                                     tools=prepared.tools, kwargs=prepared.template_kwargs,
+-                                                    base=len(state.ids))
++                                                    base=len(state.ids), keyed=keyed, pics=pics)
+                     if isinstance(made, str):
+                         why = made
+                     else:
+@@ -240,6 +251,13 @@ class GlmApp(App):
+             self.record_counts["not written: " + why.split(":")[0]] += 1
+         return info
+ 
++    def _media_tokens(self) -> frozenset:
++        """9015: the picture and clip marker tokens (a reply that writes one keeps no record)."""
++
++        names = ("<|begin_of_image|>", "<|image|>", "<|end_of_image|>", "<|begin_of_video|>", "<|video|>",
++                 "<|end_of_video|>")
++        return frozenset(t for t in (self.tok.token_to_id(n) for n in names) if t is not None)
++
+     def health_extra(self) -> dict[str, Any]:
+         """9004: turn records on /health: on or off, kept states carrying one, holds waiting, counts."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/labels.py tensorfold/families/glm5_next/cuda/labels.py
+index 731badf..711aa8d 100644
+--- tensorfold/families/glm5_next/cuda/labels.py
++++ tensorfold/families/glm5_next/cuda/labels.py
+@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any
+ 
+-LABEL_VERSION = 4
++LABEL_VERSION = 5                                # 9015: pictures (M records) and marked tool part lists
+ # chat_template_kwargs keys a request may set and still take the label path : anything else could
+ # replace the conversation (``messages``), the tools header (``tools``) or the prompt's end (``add_generation_prompt``)
+ ALLOWED_KWARGS = frozenset({"clear_thinking", "enable_thinking", "reasoning_effort", "thinking"})
+@@ -78,11 +78,23 @@ def digest(text: Any) -> str:
+ 
+ 
+ class Marks:
+-    """One render's marks: ``m`` at a message's content start, ``rs`` / ``re`` around an assistant's reasoning."""
++    """One render's marks: ``m`` at a message's content start, ``rs`` / ``re`` around an assistant's reasoning, ``p``
++    before each picture's or clip's markers (9015: ``tf_mark``, as ``server.prompts.MediaMarks`` places them)."""
+ 
+     def __init__(self, nonce: str | None = None) -> None:
+         self.nonce = nonce or secrets.token_hex(8)
+-        self.pattern = re.compile("\x00tf-(m|rs|re)-" + re.escape(self.nonce) + r":(\d+)\x00")
++        self.pattern = re.compile("\x00tf-(m|rs|re|p)-" + re.escape(self.nonce) + r":(\d+)\x00")
++
++    def media(self, messages: list[Any]) -> int:
++        """9015: a ``p`` mark on every picture and clip part, numbered in message and part order (MediaMarks' own)."""
++
++        k = 0
++        for m in messages:
++            for part in m.get("content") if isinstance(m, dict) and isinstance(m.get("content"), list) else ():
++                if isinstance(part, dict) and part.get("type") in ("image", "video"):
++                    part["tf_mark"] = self("p", k)
++                    k += 1
++        return k
+ 
+     def __call__(self, kind: str, i: int) -> str:
+         return f"\x00tf-{kind}-{self.nonce}:{i}\x00"
+@@ -100,7 +112,8 @@ class Marks:
+                 m.pop("reasoning", None)
+                 m["content"] = self("m", i) + _text(content).strip()
+                 m["reasoning_content"] = self("rs", i) + (reasoning or "") + self("re", i)
+-            elif role in ("user", "system", "developer") or (role == "tool" and isinstance(m.get("content"), str)):
++            elif role in ("user", "system", "developer") or (role == "tool" and (isinstance(m.get("content"), str)
++                                                                                  or _plain_parts(m.get("content")))):
+                 c = m.get("content")
+                 if isinstance(c, str):
+                     m["content"] = self("m", i) + c
+@@ -110,6 +123,14 @@ class Marks:
+         return out
+ 
+ 
++def _plain_parts(content: Any) -> bool:
++    """9015: a tool result sent as a plain part list (text, pictures, clips; no ``output`` part, not a tool reference
++    first), which the template renders as its visible text: a mark in a text part ahead of it reads the same."""
++
++    return (isinstance(content, list) and bool(content) and all(isinstance(p, dict) and p.get("type") in ("text", "image",
++            "video") and "output" not in p for p in content) and content[0].get("type") != "tool_reference")
++
++
+ @dataclass
+ class Render:
+     """A marked render, analysed: the production text (``real``), the label text (reasoning spans out), and where
+@@ -120,6 +141,9 @@ class Render:
+     start_real: dict[int, int] = field(default_factory=dict)
+     start_label: dict[int, int] = field(default_factory=dict)
+     roles: list[str] = field(default_factory=list)
++    media: list[tuple[int, int, int]] = field(default_factory=list)   # 9015: (part number, real offset, label offset)
++    media_hidden: bool = False          # 9015: a picture mark inside hidden reasoning: no labels at all
++    idents: list[bytes] = field(default_factory=list)   # 9015: each picture's identity, in ``media``'s order
+ 
+ 
+ def analyse(text: str, messages: list[Any], marks: Marks) -> Render:
+@@ -130,6 +154,8 @@ def analyse(text: str, messages: list[Any], marks: Marks) -> Render:
+     rlen = llen = pos = 0
+     hidden = False
+     first: dict[tuple[int, str], tuple[int, int]] = {}          # (message, kind) -> (real offset, label offset)
++    media: list[tuple[int, int, int]] = []
++    media_hidden = False
+     for m in marks.pattern.finditer(text):
+         piece = text[pos:m.start()]
+         real.append(piece)
+@@ -138,14 +164,18 @@ def analyse(text: str, messages: list[Any], marks: Marks) -> Render:
+             label.append(piece)
+             llen += len(piece)
+         kind, i = m.group(1), int(m.group(2))
+-        first.setdefault((i, kind), (rlen, llen))
+-        hidden = kind == "rs" or (hidden and kind != "re")
++        if kind == "p":                                          # 9015: a picture's place, taking up no text
++            media.append((i, rlen, llen))
++            media_hidden = media_hidden or hidden
++        else:
++            first.setdefault((i, kind), (rlen, llen))
++            hidden = kind == "rs" or (hidden and kind != "re")
+         pos = m.end()
+     real.append(text[pos:])
+     if not hidden:
+         label.append(text[pos:])
+     out = Render("".join(real), "".join(label), roles=[str(m.get("role")) if isinstance(m, dict) else "" for m in
+-                                                         messages])
++                                                         messages], media=media, media_hidden=media_hidden)
+     i = 0
+     while i < len(messages):
+         role = out.roles[i]
+@@ -185,9 +215,11 @@ def blob(x: str | bytes) -> bytes:
+     return len(b).to_bytes(8, "little") + b
+ 
+ 
+-def _pass(ns: bytes, render: Render, stop: int | None = None):
++def _pass(ns: bytes, render: Render, stop: int | None = None, pictures: bool = True):
+     """Run the one pass: yields (message index, the hash after that message). ``stop``: where the text ends for the
+-    last span (the generation prompt's start), else the text's end."""
++    last span (the generation prompt's start), else the text's end. 9015: a span holding pictures adds one typed
++    record after its text, each picture's offset in the span and its identity (``pictures``: False for the
++    picture-blind pass that only names a miss)."""
+ 
+     starts = sorted(render.start_label)
+     h = hashlib.sha256(ns)
+@@ -198,35 +230,40 @@ def _pass(ns: bytes, render: Render, stop: int | None = None):
+         h.update(blob(role))
+         if i in render.start_label:
+             nxt = after[i]
+-            hi = render.start_label[nxt] if nxt is not None else end
+-            h.update(b"S" + blob(render.label[render.start_label[i]:hi]))
++            lo, hi = render.start_label[i], render.start_label[nxt] if nxt is not None else end
++            h.update(b"S" + blob(render.label[lo:hi]))
++            if pictures and render.idents:
++                inside = [(off - lo).to_bytes(8, "little") + ident for (_, _, off), ident in
++                          zip(render.media, render.idents) if lo <= off < hi]
++                if inside:
++                    h.update(b"M" + blob(b"".join(inside)))
+         else:
+             h.update(b"N")
+         yield i, h
+ 
+ 
+-def struct_labels(ns: bytes, render: Render) -> dict[int, str]:
++def struct_labels(ns: bytes, render: Render, pictures: bool = True) -> dict[int, str]:
+     """{assistant message j: its label}, for each assistant turn whose start and end (the next message's start) are
+     verified."""
+ 
+-    if not render.start_label:
++    if not render.start_label or render.media_hidden:
+         return {}
+     out: dict[int, str] = {}
+     n = len(render.roles)
+-    for i, h in _pass(ns, render):
++    for i, h in _pass(ns, render, pictures=pictures):
+         if render.roles[i] == "assistant" and i in render.start_label and i + 1 < n and i + 1 in render.start_label:
+             out[i] = h.copy().hexdigest()[:32]
+     return out
+ 
+ 
+-def prefix_state(ns: bytes, render: Render):
++def prefix_state(ns: bytes, render: Render, pictures: bool = True):
+     """The pass over a request's whole render, its last span cut before the generation prompt: what a reply's label
+     continues from (``continue_label``). None when the render does not end on the generation prompt or has no start."""
+ 
+-    if not render.start_label or not render.label.endswith(GEN):
++    if not render.start_label or not render.label.endswith(GEN) or render.media_hidden:
+         return None
+     h = None
+-    for _, h in _pass(ns, render, stop=len(render.label) - len(GEN)):
++    for _, h in _pass(ns, render, stop=len(render.label) - len(GEN), pictures=pictures):
+         pass
+     return h.copy() if h is not None else None
+ 
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index a80ce99..0bbc887 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -949,7 +949,9 @@ class MultiDecoder:
+             self.broken = exc
+             raise
+         self.lanes[sid].key = key
+-        self.lanes[sid].inherit = self._turn_inherit(hit, prompt) if hit is not None else None
++        # 9015: a picture prompt's record tail is keyed: compared with the keyed prompt
++        self.lanes[sid].inherit = self._turn_inherit(hit, key if key is not None else prompt) if hit is not None \
++            else None
+ 
+     def _lazy_feed(self, prepared, cut: int):
+         """9014, rank 0: the feed of a prompt resumed at ``cut``: the items whose rows end past it, encoded by ``ensure``
+diff --git tensorfold/families/glm5_next/cuda/resume.py tensorfold/families/glm5_next/cuda/resume.py
+index c3d7a92..951596a 100644
+--- tensorfold/families/glm5_next/cuda/resume.py
++++ tensorfold/families/glm5_next/cuda/resume.py
+@@ -15,7 +15,7 @@ import json
+ import os
+ from typing import Any
+ 
+-from .turn_records import Turn, View, body_table, body_tail, idvec_digest, parse_key, t_digest
++from .turn_records import Turn, View, body_pics, body_table, body_tail, idvec_digest, parse_key, t_digest
+ from tensorfold.cuda.unlocked import encode_ids
+ 
+ ORIGIN_CHARS = 64            # a text turn's visible content that proves it was ours (verify, rows 10-11)
+@@ -87,6 +87,59 @@ def read_body(disk: Any, entry: Any) -> list[str] | None:
+     return body if isinstance(body, list) else None
+ 
+ 
++def _head(carrier: tuple, base: int) -> list[int]:
++    """9015: the carrier's ids up to ``base`` as records key them: a kept state's keyed ids (``key``, rank 0: its plain
++    ids for a text prompt), a stored entry's ids (keyed already)."""
++
++    obj = carrier[1]
++    ids = getattr(obj, "key", None) if carrier[0] == "kept" else obj.ids
++    head = (ids if ids is not None else obj.ids)[:base]
++    return head.tolist() if hasattr(head, "tolist") else list(head)            # numpy: tolist is ~3x faster
++
++
++def rebuild(v: View, j: int, T: list[int], body: Any) -> tuple[str | None, Any]:
++    """9015: (why not, None) or (None, layout): the record's tokens T (keyed) plus the request's new part, laid out
++    with the request's own pictures, checked against what production made of the request: the record's pictures are
++    the request's first ones (rows and keys), T holds each of them at its rows, and the new part's tokens are
++    production's own tail."""
++
++    import numpy as np
++
++    from tensorfold.vision.glm import GlmClip, GlmPrepared
++
++    prod, image = v.vision, v.frontend.image_token
++    start = v.render.start_real[j + 1]
++    k = len(prod.item_rows) - sum(1 for _, off, _ in v.render.media if off >= start)
++    pics = body_pics(body)
++    if k < 0 or len(pics) != k:
++        return "pictures differ", None
++    for p, (kind, _), rows, key in zip(pics, prod.items, prod.item_rows, prod.item_keys):
++        if p[0] != kind or int(p[1]) != int(rows) or int(p[2]) != int(key):
++            return "pictures differ", None
++    arr = np.asarray(T, dtype=np.int64)
++    neg = np.flatnonzero(arr < 0)
++    expect = np.repeat(-1 - np.asarray(prod.item_keys[:k], dtype=np.int64), prod.item_rows[:k])
++    if len(neg) != len(expect) or not np.array_equal(arr[neg], expect):
++        return "record damaged", None
++    if np.any(arr == image):                     # a bare picture token: a quoted marker or a model's, never ours
++        return "pictures differ", None
++    images = [x for kind, x in prod.items[k:] if kind == "image"]
++    clips = [GlmClip(x, tuple(s)) for (kind, x), s in zip(prod.items[k:], prod.item_seconds[k:]) if kind == "video"]
++    sfx = v.frontend.prepare(v.render.real[start:], images, videos=clips)
++    ids_s = list(sfx.token_ids)
++    if not ids_s or ids_s != list(prod.token_ids[len(prod.token_ids) - len(ids_s):]):
++        return "suffix differs", None
++    cut, covered = len(prod.token_ids) - len(ids_s), sum(prod.item_rows[:k])
++    if (covered and prod.positions[covered - 1] >= cut) or (covered < len(prod.positions)
++                                                            and prod.positions[covered] < cut):
++        return "pictures differ", None
++    plain = np.where(arr < 0, image, arr).tolist()
++    tokens = plain + ids_s
++    positions = neg.tolist() + [p + len(plain) for p in sfx.positions]
++    return None, GlmPrepared(tokens, list(prod.items), positions, prod.content_hash, list(prod.item_rows),
++                             list(prod.item_keys), list(prod.item_idents), list(prod.item_seconds))
++
++
+ def lookup(multi: Any, tok: Any, v: View) -> View:
+     """The deepest record ``v`` continues: sets ``hit``, ``hit_turn``, ``t_len``, ``suffix`` and ``context``; else
+     ``reason`` says why not (the deepest label's reason)."""
+@@ -129,13 +182,28 @@ def lookup(multi: Any, tok: Any, v: View) -> View:
+         if why is not None:
+             miss(why)
+             continue
+-        head = carrier[1].ids[:carrier[3]["base"]]           # a stored entry's ids are numpy: tolist is ~3x faster
+-        T = (head.tolist() if hasattr(head, "tolist") else list(head)) + body_tail(body)
++        T = _head(carrier, carrier[3]["base"]) + body_tail(body)
+         if t_digest(T) != carrier[3]["t_sha"]:
+             miss("record damaged")
+             continue
+-        suffix = encode_ids(tok, v.render.real[v.render.start_real[j + 1]:], False)    # 9006: GIL released
+-        v.hit, v.hit_turn, v.t_len, v.suffix, v.context, v.reason = carrier[2], j, len(T), len(suffix), T + suffix, ""
+-        v.hit_table = table                      # a record of this request's reply keeps these rows (turn_records)
++        if v.vision is None:
++            if T and min(T) < 0:                  # a picture record cannot serve a request without its pictures
++                miss("pictures differ")
++                continue
++            suffix = encode_ids(tok, v.render.real[v.render.start_real[j + 1]:], False)    # 9006: GIL released
++            context, layout = T + suffix, None
++        else:
++            why, layout = rebuild(v, j, T, body)
++            if why is not None:
++                miss(why)
++                continue
++            context = layout.token_ids
++        v.hit, v.hit_turn, v.t_len, v.suffix, v.context, v.reason = (carrier[2], j, len(T), len(context) - len(T),
++                                                                      context, "")
++        v.hit_table, v.hit_vision = table, layout   # a record of this request's reply keeps these rows (turn_records)
+         return v
++    if v.reason == "no record" and v.blind:      # 9015: the same conversation but for its pictures: name the miss
++        blind = {c[3]["blind"] for cs in index.values() for c in cs}
++        if any(label in blind for label in v.blind.values()):
++            v.reason = "pictures differ"
+     return v
+diff --git tensorfold/families/glm5_next/cuda/turn_records.py tensorfold/families/glm5_next/cuda/turn_records.py
+index c819f13..b9d8f89 100644
+--- tensorfold/families/glm5_next/cuda/turn_records.py
++++ tensorfold/families/glm5_next/cuda/turn_records.py
+@@ -23,7 +23,7 @@ from typing import Any
+ 
+ from . import labels as L
+ 
+-RECORD = "r4"
++RECORD = "r5"                        # 9015: T keyed (pictures), its sha256 over int64, a picture table
+ MAX_REASONING_TOKENS = 65536        # a longer reasoning is not recorded
+ LOOP_RATIO = 8.0                     # a reasoning tail compressing past this is a loop (issue #89)
+ LOOP_TAIL = 16 << 10                 # bytes of the reasoning's end the ratio is measured on
+@@ -31,8 +31,10 @@ LOOP_MIN = 1 << 10                   # shorter tails are never judged
+ 
+ 
+ # -- the record's two fields ---------------------------------------------------------------------------------------
+-def record_key(label: str, idvec: str, t_sha: str, turns: int, base: int) -> str:
+-    return f"{RECORD}|{label}|{idvec}|{t_sha}|{int(turns)}|{int(base)}"
++def record_key(label: str, idvec: str, t_sha: str, turns: int, base: int, blind: str | None = None) -> str:
++    """9015: ``blind``, the label without the pictures (a text record's is its label), names a miss only."""
++
++    return f"{RECORD}|{label}|{blind or label}|{idvec}|{t_sha}|{int(turns)}|{int(base)}"
+ 
+ 
+ def parse_key(key: Any) -> dict[str, Any] | None:
+@@ -41,17 +43,20 @@ def parse_key(key: Any) -> dict[str, Any] | None:
+     if not isinstance(key, str):
+         return None
+     parts = key.split("|")
+-    if len(parts) != 6 or parts[0] != RECORD:
++    if len(parts) != 7 or parts[0] != RECORD:
+         return None
+     try:
+-        return {"label": parts[1], "idvec": parts[2], "t_sha": parts[3], "turns": int(parts[4]),
+-                "base": int(parts[5])}
++        return {"label": parts[1], "blind": parts[2], "idvec": parts[3], "t_sha": parts[4], "turns": int(parts[5]),
++                "base": int(parts[6])}
+     except ValueError:
+         return None
+ 
+ 
+-def record_body(tail: list[int], table: list[dict[str, Any]]) -> list[str]:
+-    return [json.dumps({"tail": [int(t) for t in tail], "turns": table}, ensure_ascii=False, separators=(",", ":"))]
++def record_body(tail: list[int], table: list[dict[str, Any]], pics: list | None = None) -> list[str]:
++    body: dict[str, Any] = {"tail": [int(t) for t in tail], "turns": table}
++    if pics:
++        body["pics"] = pics                      # 9015: [kind, rows, key] per picture or clip T holds, in order
++    return [json.dumps(body, ensure_ascii=False, separators=(",", ":"))]
+ 
+ 
+ def _body(body: Any) -> dict[str, Any]:
+@@ -71,10 +76,15 @@ def body_table(body: Any) -> list[dict[str, Any]]:
+     return list(_body(body)["turns"])
+ 
+ 
++def body_pics(body: Any) -> list[list[Any]]:
++    return list(_body(body).get("pics") or [])
++
++
+ def t_digest(T: list[int]) -> str:
+-    """sha256 of T as 32-bit integers (native order; checked against records made on the same machine)."""
++    """sha256 of T as 64-bit integers (native order; checked against records made on the same machine). 9015: a
++    picture prompt's T is keyed, its picture rows holding -1 - a 62-bit key."""
+ 
+-    return hashlib.sha256(array("i", T).tobytes()).hexdigest()
++    return hashlib.sha256(array("q", T).tobytes()).hexdigest()
+ 
+ 
+ def idvec_digest(ids: list[list[str]]) -> str:
+@@ -121,6 +131,7 @@ class View:
+     turns: list[Turn]
+     labels: dict[int, str] = field(default_factory=dict)
+     prefix: Any = None
++    prefix_blind: Any = None             # 9015: the prefix pass without the pictures (a picture view's)
+     hit: Any = None
+     hit_turn: int | None = None
+     t_len: int = 0
+@@ -128,6 +139,10 @@ class View:
+     reason: str = ""
+     context: list[int] | None = None
+     hit_table: list[dict[str, Any]] | None = None    # the hit record's rows for the turns it covers (9005)
++    vision: Any = None                   # 9015: the request's picture layout as production made it
++    frontend: Any = None                 # 9015: the picture frontend (the new part's layout)
++    blind: dict[int, str] = field(default_factory=dict)   # 9015: labels without the pictures: name a miss only
++    hit_vision: Any = None               # 9015: the layout of the record's tokens plus the new part
+ 
+ 
+ def loop_reason(reasoning: str, content: str, calls: Any, reasoning_tokens: int,
+@@ -146,15 +161,17 @@ def loop_reason(reasoning: str, content: str, calls: Any, reasoning_tokens: int,
+ 
+ def eligibility(*, chat: bool, thinking: bool, draft: bool, ignore_eos: bool, kwargs: Any, pictures: bool,
+                 result: dict[str, Any], out: list[int], think_close: int | None, call_open: int | None,
+-                runs: int = 1, max_reasoning: int = MAX_REASONING_TOKENS) -> str | None:
+-    """Why a finished reply gets no record, or None."""
++                runs: int = 1, max_reasoning: int = MAX_REASONING_TOKENS,
++                media_tokens: frozenset = frozenset()) -> str | None:
++    """Why a finished reply gets no record, or None. 9015: picture conversations get records; a reply that writes a
++    picture or clip marker does not (its tokens would stand where no picture is)."""
+ 
+     if not chat:
+         return "not a chat request"
+     if not thinking:
+         return "thinking off"
+-    if pictures:
+-        return "pictures"
++    if media_tokens and any(t in media_tokens for t in out):
++        return "media token in the reply"
+     if not draft:
+         return "draft:false"
+     if ignore_eos:
+@@ -189,16 +206,20 @@ def reply_message(result: dict[str, Any]) -> dict[str, Any]:
+ 
+ 
+ def make_record(template, view: View, result: dict[str, Any], *, prompt: list[int], out: list[int], tools: Any,
+-                kwargs: dict[str, Any] | None, base: int) -> tuple[str, list[str], list[int]] | str:
+-    """(key, body, tail) of an eligible reply's record on a state of ``base`` tokens, or why not."""
++                kwargs: dict[str, Any] | None, base: int, keyed: list[int] | None = None,
++                pics: list | None = None) -> tuple[str, list[str], list[int]] | str:
++    """(key, body, tail) of an eligible reply's record on a state of ``base`` tokens, or why not. 9015: ``keyed`` is
++    a picture prompt's keyed ids (T is keyed: picture rows hold -1 - their key), ``pics`` its picture table."""
+ 
+     marks = L.Marks()
+     text, history = template.render_marked([reply_message(result)], tools=tools,
+                                            extra={**(kwargs or {}), "add_generation_prompt": False}, marks=marks)
+-    label = L.continue_label(view.prefix, L.analyse(text, history, marks))
++    reply_render = L.analyse(text, history, marks)
++    label = L.continue_label(view.prefix, reply_render)
+     if label is None:
+         return "label"
+-    T = list(prompt) + list(out[:-1])
++    blind = L.continue_label(view.prefix_blind, reply_render) if view.prefix_blind is not None else None
++    T = list(keyed if keyed is not None else prompt) + list(out[:-1])
+     if not 0 < base <= len(prompt):
+         return "state outside the prompt"
+     reply = Turn(len(view.history), "own", L.digest(result.get("reasoning")),
+@@ -212,7 +233,7 @@ def make_record(template, view: View, result: dict[str, Any], *, prompt: list[in
+         # this request presented them (a client that dropped the thinking would make them look empty)
+         rows = [*view.hit_table, *(t.record() for t in view.turns if t.msg > view.hit_turn), reply.record()]
+     tail = T[base:]
+-    return (record_key(label, idvec, t_digest(T), len(turns), base), record_body(tail, rows), tail)
++    return (record_key(label, idvec, t_digest(T), len(turns), base, blind), record_body(tail, rows, pics), tail)
+ 
+ 
+ # -- the request's side ----------------------------------------------------------------------------------------------
+@@ -248,26 +269,52 @@ def turns_of(original: list[Any], history: list[Any], clear_thinking: bool) -> l
+     return out
+ 
+ 
+-def view(template, body: dict[str, Any], prepared, ns: bytes, clear_thinking: bool) -> View | str:
+-    """The request through one marked render, or why it takes no label path."""
++def view(template, body: dict[str, Any], prepared, ns: bytes, clear_thinking: bool, frontend: Any = None
++         ) -> View | str:
++    """The request through one marked render, or why it takes no label path. 9015: a request with pictures or clips
++    is rendered as production renders it (``server.prompts.prepare_images``: the media split out, marked, quoted
++    markers escaped), and each picture's identity is bound to its place."""
+ 
+     if not prepared.thinking:
+         return "thinking off"
+     if not L.kwargs_allowed(body.get("chat_template_kwargs")):
+         return "chat_template_kwargs"
+-    if prepared.vision is not None or prepared.text is None:
++    if prepared.text is None or (prepared.vision is not None and frontend is None):
+         return "pictures"
+     # the thinking rule this request renders with (its own clear_thinking, else the server's) is part of its
+     # namespace: a record made under the other rule never serves it
+     clear = bool((prepared.template_kwargs or {}).get("clear_thinking", clear_thinking))
+     ns = hashlib.sha256(ns + (b"|clear:1" if clear else b"|clear:0")).digest()
+     marks = L.Marks()
+-    text, history = template.render_marked(body["messages"], tools=prepared.tools, extra=prepared.template_kwargs,
+-                                           marks=marks)
++    messages = body["messages"]
++    if prepared.vision is not None:
++        from tensorfold.vision.images import split_images
++
++        messages, _ = split_images(messages, limits=frontend.image_limits, allow_urls=bool(frontend.allow_urls),
++                                   allow_videos=bool(getattr(frontend, "videos", False)),
++                                   max_videos=getattr(frontend, "max_videos", None),
++                                   tool_media=bool(getattr(frontend, "tool_media", False)))
++        marks.media(messages)
++    text, history = template.render_marked(messages, tools=prepared.tools, extra=prepared.template_kwargs,
++                                           marks=marks, allow_images=prepared.vision is not None)
++    if prepared.vision is not None:
++        ends = [m.end() for m in marks.pattern.finditer(text) if m.group(1) == "p"]
++        text = frontend.escape_quoted(text, ends)          # as production escapes the markers a chat only quotes
+     r = L.analyse(text, history, marks)
+     if r.real != prepared.text:
+         return "render differs"
++    if prepared.vision is not None:
++        v = prepared.vision
++        idents = list(getattr(v, "item_idents", None) or [])
++        if (r.media_hidden or len(r.media) != len(idents) or len(idents) != len(v.item_keys)
++                or sum(v.item_rows) != len(v.positions)):
++            return "pictures without identity"
++        r.idents = idents
+     turns = turns_of(body["messages"], history, clear)
+     if turns is None:
+         return "unpaired turns"
+-    return View(ns.hex(), r, history, turns, L.struct_labels(ns, r), L.prefix_state(ns, r))
++    out = View(ns.hex(), r, history, turns, L.struct_labels(ns, r), L.prefix_state(ns, r))
++    if prepared.vision is not None:
++        out.vision, out.frontend, out.blind = prepared.vision, frontend, L.struct_labels(ns, r, pictures=False)
++        out.prefix_blind = L.prefix_state(ns, r, pictures=False)
++    return out
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index 1724166..2b1d882 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -14,6 +14,7 @@ class RenderedPrompt:
+     tokens: list[int]
+     history_len: int = 0
+     vision: Any = None
++    text: str | None = None              # 9015: the text the pictures were laid out in (marks out, quotes escaped)
+ 
+ 
+ def has_images(messages):
+@@ -167,7 +168,7 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+         raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
+     finally:
+         slot.release()
+-    return RenderedPrompt(list(prepared.token_ids), vision=prepared)
++    return RenderedPrompt(list(prepared.token_ids), vision=prepared, text=prompt_text)
+ 
+ 
+ def prepare_prompt(app, messages, tools, thinking, prompt, fields):

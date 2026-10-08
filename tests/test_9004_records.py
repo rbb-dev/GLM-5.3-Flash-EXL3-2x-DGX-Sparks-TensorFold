@@ -29,7 +29,7 @@ def test_an_eligible_reply_lands_on_its_own_state_with_its_exact_tokens(make):
     T = p1.prompt + r1["out"][:-1]                          # the prompt, then the reply minus its end token
     assert r1["stats"]["resume"]["written"] and T_of(state) == T
     key = R.parse_key(state.turn_key)
-    assert key["t_sha"] == hashlib.sha256(array("i", T).tobytes()).hexdigest() and key["turns"] == 1
+    assert key["t_sha"] == hashlib.sha256(array("q", T).tobytes()).hexdigest() and key["turns"] == 1   # r5: int64
     assert key["base"] == len(state.ids) and R.body_table(state.turn)[-1]["prov"] == "own"
     assert state._turn_tail == R.body_tail(state.turn) and not engine.multi.record_due
 

@@ -30,6 +30,7 @@ class Kept:
     turn_key: str | None = None
     turn: list | None = None
     _turn_tail: list | None = None
+    key: list | None = None          # 9015: keyed ids (a picture prompt's rows hold -1 - their key), as MultiDecoder
 
 
 @dataclass
@@ -41,6 +42,7 @@ class Entry:
     name: str
     ids: Any = None
     fields: dict = field(default_factory=dict)
+    tokens: Any = None               # 9015: the plain ids (the real tier reads them from the header when it loads)
 
 
 class Disk:
@@ -57,14 +59,15 @@ class Disk:
         fields = {"turn_key": {"v": state.turn_key},
                   "turn": {"l": [{"v": b} for b in state.turn]} if state.turn else {"v": None}}
         layer = {"class": "tensorfold.families.glm5_next.cuda.decode:Snapshot", "fields": fields}
-        key = spill.ids_key(state.ids)
+        keyed = state.key if state.key is not None else state.ids        # 9015: stored and matched by keyed ids
+        key = spill.ids_key(keyed)
         name = spill.key_name(key, len(state.ids))
         header, _ = spill._header([], {"format": "x", "n": len(state.ids), "tokens": json.dumps(list(state.ids)),
                                        "layers": json.dumps([layer])})
         with open(os.path.join(self.dir, name + ".safetensors"), "wb") as f:
             f.write(header)
-        self.index[key] = Entry(key, len(state.ids), name, np.asarray(state.ids, dtype=np.int64),
-                                spill._plain([layer]))
+        self.index[key] = Entry(key, len(state.ids), name, np.asarray(keyed, dtype=np.int64),
+                                spill._plain([layer]), tokens=list(state.ids))
         self.generation += 1
 
 
@@ -82,26 +85,29 @@ class Multi:
 
         best = max((e for e in self.disk.index.values() if e.n < len(prompt) and list(e.ids) == prompt[:e.n]),
                    key=lambda e: e.n, default=None)
-        if best is None or any(len(c.ids) >= best.n and prompt[:len(c.ids)] == c.ids for c in self.kept):
+        if best is None or any(len(c.ids) >= best.n and prompt[:len(c.ids)] == (c.key or c.ids) for c in self.kept):
             return
         try:
             body = read_body(self.disk, best) if best.fields.get("turn_key") else None
         except OSError:                          # the tier: a state whose file cannot be read is not loaded
             return
-        self.kept.append(Kept([int(t) for t in best.ids], self.next_kid, turn_key=best.fields.get("turn_key"),
-                              turn=body))
+        self.kept.append(Kept(list(best.tokens) if best.tokens is not None else [int(t) for t in best.ids],
+                              self.next_kid, turn_key=best.fields.get("turn_key"), turn=body,
+                              key=[int(t) for t in best.ids]))
         self.next_kid += 1
 
-    def keep(self, prompt, holder):
+    def keep(self, prompt, holder, vision=None):
+        plain = list(prompt)
+        prompt = vision.keyed_ids() if vision is not None else plain     # 9015: kept and matched by keyed ids
         self._load(prompt)
-        hits = [c for c in self.kept if len(c.ids) < len(prompt) and prompt[:len(c.ids)] == c.ids]
+        hits = [c for c in self.kept if len(c.ids) < len(prompt) and prompt[:len(c.ids)] == (c.key or c.ids)]
         hit = max(hits, key=lambda c: len(c.ids), default=None)
         cut = len(hit.ids) if hit is not None else 0
         point = len(prompt) if len(prompt) % GRID == 0 else (len(prompt) // GRID * GRID if len(prompt) // GRID * GRID
                                                               > cut else None)
         if point is None:
             return
-        snap = Kept(list(prompt[:point]), self.next_kid)
+        snap = Kept(plain[:point], self.next_kid, key=list(prompt[:point]))
         self.next_kid += 1
         key = getattr(hit, "turn_key", None)
         if key:                                  # the inherit rule of MultiDecoder._turn_inherit
@@ -111,7 +117,7 @@ class Multi:
                 tail = body_tail(hit.turn)
             if base <= len(hit.ids) and prompt[base:base + len(tail)] == tail:
                 snap._turn_tail, snap.turn, snap.turn_key = list(tail), hit.turn, key
-        self.kept = [c for c in self.kept if c.ids != snap.ids] + [snap]
+        self.kept = [c for c in self.kept if (c.key or c.ids) != snap.key] + [snap]
         if isinstance(holder, dict):
             holder["kid"] = snap.kid
 
@@ -146,7 +152,10 @@ class Engine:
         if isinstance(holder, dict):
             holder["runs"] = holder.get("runs", 0) + 1
         if self.multi is not None:
-            self.multi.keep(list(ids), holder)
+            if extra.get("vision") is not None:               # 9015: a picture prompt is kept by its keyed ids
+                self.multi.keep(list(ids), holder, extra["vision"])
+            else:
+                self.multi.keep(list(ids), holder)
         raw, end = self.script.pop(0)
         out = self.tok.encode(raw, add_special_tokens=False).ids[:count]
         ended = bool(end) and len(out) < count
@@ -171,11 +180,13 @@ TEXT_RAW = "The file prints one. Done reading.</think>a.py prints 1; nothing els
 def make():
     folder = model_dir()
 
-    def app(limit=1_000_000, disk=None, parallel=True):
+    def app(limit=1_000_000, disk=None, parallel=True, vision=False):
         from tokenizers import Tokenizer
 
         engine = Engine(Tokenizer.from_file(str(folder / "tokenizer.json")), limit)
         engine.multi = Multi(disk) if parallel else None      # PARALLEL=1: no parallel decoder
+        if vision:
+            engine.vision = picture_frontend(folder)
         return GlmApp(engine, folder, "glm-5.3-flash", default_thinking=True, sampling={"temperature": 0.0},
                       max_tokens=4096), engine
     return app
@@ -235,3 +246,39 @@ def restart(engine, make, folder, **kw):
     for c in engine.multi.kept:
         disk.store(c)
     return make(disk=disk, **kw)
+
+
+def picture_frontend(folder):
+    """9015: the real GLM picture frontend (decode, fit, layout, keys) without its GPU tower, as --vision serves it."""
+
+    from collections import OrderedDict
+
+    from tokenizers import Tokenizer
+
+    from tensorfold.vision import glm as G
+
+    v = object.__new__(G.GlmVision)
+    v.image_token, v.limits, v.allow_urls = 154854, G.GlmVisionLimits(), False
+    v._pictures, v._canvases = OrderedDict(), OrderedDict()
+    v.tok = Tokenizer.from_file(str(folder / "tokenizer.json"))
+    return v
+
+
+def png(size=(280, 168), colour=(40, 90, 160)):
+    """A picture's PNG bytes: ``colour`` with a stripe, so two colours are two different pictures."""
+
+    import io
+
+    from PIL import Image, ImageDraw
+
+    im = Image.new("RGB", size, colour)
+    ImageDraw.Draw(im).rectangle([10, 10, size[0] // 2, 30], fill=(255 - colour[0], 0, colour[2]))
+    b = io.BytesIO()
+    im.save(b, "PNG")
+    return b.getvalue()
+
+
+def picture_part(data):
+    import base64
+
+    return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}}
