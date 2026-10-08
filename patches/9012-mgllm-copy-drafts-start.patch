@@ -1,0 +1,25 @@
+# A stream's copy drafter started from its prompt array. When a long prompt is in, both ranks give the copy drafter the
+# prompt and the first token; that took a list copy and a numpy conversion of the whole prompt on the scheduler thread
+# (49 ms at 1,000,000 tokens on an x86 core, measured), while no stream decodes. Now rank 0 hands over the request
+# thread's array (9009) and rank 1 converts its list in one C pass (9011's as_ids). mgllm, 2026-10-08.
+# Tests: tests/test_9012_copy_drafts_start.py (CPU).
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 1a314f9..40e92d3 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -2101,7 +2101,13 @@ class MultiDecoder:
+         s.started = time.perf_counter()
+         if lane.policy is not None and self.g.copy is not None:
+             c = self.g.copy                 # no pads: batched windows are not the single-stream widths
+-            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=len(prompt),
++            arr = getattr(s, "prompt_arr", None)      # 9012: rank 0's from the request thread (9009)
++            if arr is None or len(arr) != len(prompt):
++                from tensorfold.cuda.spill import as_ids
++
++                arr = as_ids(prompt)                  # rank 1: one C pass
++            context = np.concatenate([arr.astype(np.int32, copy=False), np.array([first], dtype=np.int32)])
++            lane.copies = CopyDrafts(context, c.match, c.most, prompt=len(prompt),
+                                      reply_match=c.reply_match, miss_most=c.miss_most)
+         if lane.policy is not None:
+             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
