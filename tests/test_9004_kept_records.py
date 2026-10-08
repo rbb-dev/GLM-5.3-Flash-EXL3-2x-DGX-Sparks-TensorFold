@@ -245,7 +245,8 @@ def store_file(store, ids, fields):
     from tensorfold.cuda import spill
 
     layer = {"class": "tensorfold.families.glm5_next.cuda.decode:Snapshot", "fields": fields}
-    info = {"format": spill.FORMAT, "compat": store.compat, "model": "", "n": len(ids), "tokens": json.dumps(ids),
+    tokens = spill.ids_field(spill.as_ids(ids), False) if hasattr(spill, "ids_field") else json.dumps(ids)  # 9011
+    info = {"format": spill.FORMAT, "compat": store.compat, "model": "", "n": len(ids), "tokens": tokens,
             "layers": json.dumps([layer]), "rows": "[]", "head": "0", "saved": "0", "crc32": spill._crc_placeholder(0)}
     header, _ = spill._header([], info)
     with open(os.path.join(store.dir, spill.key_name(spill.ids_key(ids), len(ids)) + ".safetensors"), "wb") as f:

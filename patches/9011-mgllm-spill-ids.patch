@@ -1,0 +1,166 @@
+# A stored prompt's token ids as bytes, not JSON lists. The spill tier wrote each prompt's ids into its file's header as
+# a JSON list of ints, and read them back the same way, on the engine's scheduler thread (every rank) for a save and a
+# load, and at start for each file's scan: 270 ms to save and 143 ms to read a 1,000,000-token prompt's on an x86 core
+# (measured), while no stream decodes. Now one conversion (as_ids: one C pass, array('q')) serves the key, the header
+# field and the index entry, the field holds base64 of the raw ids (int32, or int64 for a picture prompt's keyed ids),
+# and reading it back is a decode and a view; prestage reuses the request thread's prompt array (9009) and a load's ids
+# come back in one C pass. The file format is tensorfold-cuda-spill-3: files of the old format are not read (each new
+# build's tier starts empty anyway). mgllm, 2026-10-08.
+# Tests: tests/test_9011_spill_ids.py (CPU: a real save, a restart's scan, the ids exact).
+
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index b76978e..f1c8b3a 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -28,6 +28,7 @@ conventions and flag names are those of TensorFold's MLX spill (pull request #68
+ 
+ from __future__ import annotations
+ 
++import base64
+ import contextlib
+ import dataclasses
+ import errno
+@@ -41,6 +42,7 @@ import struct
+ import threading
+ import time
+ import zlib
++from array import array as _ints
+ from collections.abc import Callable, Sequence
+ from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import dataclass, field
+@@ -49,7 +51,7 @@ from typing import Any
+ import numpy as np
+ import torch
+ 
+-FORMAT = "tensorfold-cuda-spill-2"
++FORMAT = "tensorfold-cuda-spill-3"       # 9011: token ids as base64 of their bytes (was: JSON lists)
+ CHUNK = 64 << 20                       # bytes a staging buffer
+ ALIGN = 4096                           # O_DIRECT offsets, lengths and buffers
+ BLOCK = 8 << 20                        # bytes one CRC-32 covers (CHUNK is a multiple of it)
+@@ -193,8 +195,31 @@ def weights_id(*dirs) -> str:
+     return digest.hexdigest()[:16]
+ 
+ 
++def as_ids(ids: Sequence[int]) -> np.ndarray:
++    """9011: token ids as one int64 array: an array as it is, a list of ints in one C pass (``array('q')``, two to
++    four times faster than ``np.asarray`` on a list of a million)."""
++
++    if isinstance(ids, np.ndarray):
++        return ids.astype(np.int64, copy=False)
++    return np.frombuffer(_ints("q", ids), dtype=np.int64)
++
++
++def ids_field(ids: np.ndarray, wide: bool) -> str:
++    """9011: a header field holding ``ids``: a width letter, then base64 of the raw little-endian values, int32 for a
++    prompt's ids or int64 (``wide``) for keyed ids, whose picture rows hold -1 - a 62-bit key."""
++
++    data = np.asarray(ids).astype("<i8" if wide else "<i4", copy=False).tobytes()
++    return ("q" if wide else "i") + base64.b64encode(data).decode("ascii")
++
++
++def ids_from_field(text: str) -> np.ndarray:
++    """``ids_field`` read back, as int64."""
++
++    return np.frombuffer(base64.b64decode(text[1:]), dtype={"q": "<i8", "i": "<i4"}[text[0]]).astype(np.int64)
++
++
+ def ids_key(ids: Sequence[int]) -> tuple[int, int]:
+-    h = hashlib.sha1(np.asarray(ids, dtype=np.int64).tobytes()).digest()
++    h = hashlib.sha1(as_ids(ids).tobytes()).digest()
+     return int.from_bytes(h[0:4], "big", signed=True), int.from_bytes(h[4:8], "big", signed=True)
+ 
+ 
+@@ -577,7 +602,7 @@ class SpillStore:
+                                          or [0])
+                     if os.fstat(f.fileno()).st_size != want:
+                         raise ValueError("size does not match the header")
+-                ids = np.asarray(json.loads(meta.get("keyed") or meta["tokens"]), dtype=np.int64)
++                ids = ids_from_field(meta.get("keyed") or meta["tokens"])
+                 n = int(meta["n"])
+                 key = ids_key(ids)
+                 if len(ids) != n or key_name(key, n) + ".safetensors" != name:
+@@ -674,7 +699,7 @@ class SpillStore:
+              usable: Callable[[Entry], bool] | None = None) -> Entry | None:
+         """The longest stored prompt that ``prompt`` extends (or equals, when its head row was stored)."""
+ 
+-        arr = np.asarray(prompt, dtype=np.int64)
++        arr = as_ids(prompt)                     # 9011
+         best = None
+         with self.lock:
+             entries = list(self.index.values())
+@@ -934,7 +959,8 @@ class SpillStore:
+         n = len(ids)
+         if n < self.cfg.min_tokens:
+             return None
+-        key = ids_key(ids)
++        arr = as_ids(ids)                              # 9011: one conversion for the key, the header and the entry
++        key = ids_key(arr)
+         with self.lock:
+             e = self.index.get(key)
+             if e is not None and e.n == n:             # stored or on its way (every rank alike)
+@@ -948,8 +974,8 @@ class SpillStore:
+                 raise ValueError(f"rows {name}: not contiguous")
+             items.append((f"rows.{name}", t))
+         info = {"format": FORMAT, "compat": self.compat, "model": self.model_id, "n": n,
+-                "tokens": json.dumps([int(t) for t in (ids if tokens is None else tokens)]),
+-                **({} if tokens is None else {"keyed": json.dumps([int(t) for t in ids])}),
++                "tokens": ids_field(arr if tokens is None else as_ids(tokens), False),
++                **({} if tokens is None else {"keyed": ids_field(arr, True)}),
+                 "layers": json.dumps([layer] if layer else []),
+                 "rows": json.dumps([nm for nm, _ in rows]), "head": "1" if head else "0",
+                 "saved": f"{time.time():.3f}",
+@@ -973,7 +999,7 @@ class SpillStore:
+         self._start()
+         self._throttle(size)
+         name = key_name(key, n)
+-        entry = Entry(key, n, name, size, ids=np.asarray(ids, dtype=np.int64), head=head,
++        entry = Entry(key, n, name, size, ids=arr, head=head,
+                       fields=_plain([layer] if layer else []))
+         src = None
+         if torch.cuda.is_available():
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 31b0440..1a314f9 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1510,7 +1510,7 @@ class MultiDecoder:
+         if self.disk is None or not s.draft:
+             return None
+         self._check()
+-        prompt = [int(t) for t in s.prompt]
++        prompt = s.prompt if type(s.prompt) is list else [int(t) for t in s.prompt]    # 9011: ints already
+         if s.vision is not None:                 # pictures: matched by content (keyed ids), or not at all
+             v = s.vision
+             keys = getattr(v, "item_keys", None)
+@@ -1524,7 +1524,9 @@ class MultiDecoder:
+             if len(prompt) >= h.n and prompt[:h.n] == h.ids:
+                 return h
+         hit = self._resume(prompt)
+-        e = self.disk.find(prompt, grid=self.grid)
++        arr = getattr(s, "prompt_arr", None)     # 9011: the request thread's array, when the prompt is plain
++        e = self.disk.find(arr if arr is not None and s.vision is None and len(arr) == len(prompt) else prompt,
++                           grid=self.grid)
+         if e is None or (hit is not None and len(hit.ids) >= e.n):
+             return None
+         size = align_up(e.n)
+@@ -1539,7 +1541,7 @@ class MultiDecoder:
+         self._emit(LOAD, [hi, lo, e.n, base, size, lid])
+         self._flush()
+         h = self._start_load(hi, lo, e.n, base, size, lid)
+-        h.ids = [int(t) for t in e.ids]
++        h.ids = e.ids.tolist()                   # 9011: one C pass
+         return h
+ 
+     def _start_load(self, hi: int, lo: int, n: int, base: int, size: int, lid: int):
+@@ -1609,8 +1611,10 @@ class MultiDecoder:
+             self.disk.forget(h.key)
+             self.pool.remove(x)
+             return False
+-        ids = [int(t) for t in json.loads(meta["tokens"])]
+-        keyed = json.loads(meta["keyed"]) if meta.get("keyed") else None
++        from tensorfold.cuda.spill import ids_from_field
++
++        ids = ids_from_field(meta["tokens"]).tolist()                 # 9011: bytes, one C pass to ints
++        keyed = ids_from_field(meta["keyed"]).tolist() if meta.get("keyed") else None
+         snap.ids = ids
+         snap.pending, snap.mtp_len, snap.rows, snap.nbytes = None, -1, None, 0
+         snap.kid = self.next_kid

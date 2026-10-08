@@ -19,6 +19,7 @@ NOTICE asks, this file states what the fork adds.
 | `9008-mgllm-stall-meter` | The engine's own stall meter on `/health` (`"stalls"`): every pause between two decode rounds while streams decode, what filled it (admit, round, finish, reply), and the engine's clock to place them by | this fork | Measuring only. A client sees such a pause only when it outlasts the 0.4 s stream smoothing. Test: `tests/test_9008_stall_meter.py` |
 | `9009-mgllm-lean-admit` | A long request's admission without Python-list round trips on the scheduler threads | this fork | The same values on the wire but for the message checksum (CRC-32). Test: `tests/test_9009_lean_admit.py` |
 | `9010-mgllm-gc-policy` | Python's garbage collection on the engine's own schedule: a full collection only when idle (or every 15 minutes), never in the middle of streams | this fork | `TF_GLM_GC=0` leaves Python's own collection on. Test: `tests/test_9010_gc_policy.py` |
+| `9011-mgllm-spill-ids` | The spill tier stores a prompt's token ids as bytes, not a JSON list | this fork | File format `tensorfold-cuda-spill-3`: files of the old format are not read. Test: `tests/test_9011_spill_ids.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 
