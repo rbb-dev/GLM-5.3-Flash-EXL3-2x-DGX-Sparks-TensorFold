@@ -1,0 +1,101 @@
+# When the engine's process collects garbage. A full collection walks every list, and the engine keeps prompt states'
+# ids as lists of up to a million ints: one full collection held the GIL 153 ms with 16 of them on an x86 core (10 ms
+# when they were arrays), and while it runs no stream decodes; the GLM path left Python's automatic collection on, which
+# starts a full collection whenever its counts say so. Now, once the engine is built (both ranks), what start-up made is
+# frozen and automatic collection is off: each loop iteration collects the young generations when Python itself would
+# (by their count), and a full collection runs only when the engine is idle, before it waits for work (at most every
+# 30 s), or after 15 minutes without one. TF_GLM_GC=0 leaves Python's own collection on. mgllm, 2026-10-08.
+# Tests: tests/test_9010_gc_policy.py (CPU).
+
+diff --git tensorfold/families/glm5_next/cuda/gc_policy.py tensorfold/families/glm5_next/cuda/gc_policy.py
+new file mode 100644
+index 0000000..96e11f8
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/gc_policy.py
+@@ -0,0 +1,44 @@
++"""Patch 9010: when the engine's process collects garbage. A full collection walks every list, and the engine keeps
++prompt states' ids as lists of up to a million ints: one full collection held the GIL 153 ms with 16 of them on an x86
++core (10 ms when they were arrays), and while it runs no stream decodes. So automatic collection is off: the engine's
++loop collects the young generations when Python itself would (by their count), and runs a full collection only when
++the engine is idle, or after ``force_s`` without one. TF_GLM_GC=0 leaves Python's own collection on."""
++
++from __future__ import annotations
++
++import gc as _gc
++import os
++import time
++from collections.abc import Callable
++from typing import Any
++
++
++class GcPolicy:
++    """``start`` once the engine is built (both ranks); ``tick(idle)`` once each loop iteration."""
++
++    def __init__(self, *, gc: Any = _gc, clock: Callable[[], float] = time.monotonic, young: int | None = None,
++                 idle_gap_s: float = 30.0, force_s: float = 900.0, enabled: bool | None = None) -> None:
++        self.gc, self.clock = gc, clock
++        threshold = gc.get_threshold()[0] if hasattr(gc, "get_threshold") else 0
++        self.young = young if young is not None else (threshold or 700)
++        self.idle_gap_s, self.force_s = idle_gap_s, force_s
++        self.enabled = os.environ.get("TF_GLM_GC", "1").strip() != "0" if enabled is None else enabled
++        self.last_full = clock()
++
++    def start(self) -> None:
++        """What start-up made is never collected again (frozen); then the loops take over from automatic collection."""
++
++        if self.enabled:
++            self.gc.freeze()
++            self.gc.disable()
++            self.last_full = self.clock()
++
++    def tick(self, idle: bool) -> None:
++        if not self.enabled:
++            return
++        since = self.clock() - self.last_full
++        if (idle and since >= self.idle_gap_s) or since >= self.force_s:
++            self.gc.collect(2)
++            self.last_full = self.clock()
++        elif self.gc.get_count()[0] >= self.young:
++            self.gc.collect(1)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 098a295..31b0440 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -54,6 +54,7 @@ from tensorfold.cuda.streams import Stream, next_fill
+ from . import multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
++from .gc_policy import GcPolicy
+ from .stall_meter import StallMeter
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+@@ -589,6 +590,8 @@ class MultiDecoder:
+         self.dflash_code = encode_policy(DFLASH_POLICY)
+         if self.fill_budget:
+             self.fill_costs = self._time_prompt_layers()
++        self.gc_policy = GcPolicy()                      # 9010: full collections only when idle (both ranks)
++        self.gc_policy.start()
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -2398,7 +2401,10 @@ class MultiDecoder:
+     def follow(self, once: bool = False) -> None:
+         """Rank 1: apply rank 0's messages forever (``once``: one message)."""
+ 
++        policy = getattr(self, "gc_policy", None)
+         while True:
++            if policy is not None:
++                policy.tick(self.idle)           # 9010: rank 1 collects in full only while idle as well
+             if self.idle:
+                 self.g._await_bell()
+                 self.idle = False
+@@ -2753,6 +2759,9 @@ class GlmScheduler(Scheduler):
+         self._yield()
+         reading = bool(self.loading or self.ready)
+         idle = not self.decoder.live() and self.held is None and not reading
++        policy = getattr(self.decoder, "gc_policy", None)
++        if policy is not None:
++            policy.tick(idle)                    # 9010: a full collection only before waiting for work
+         if reading and not self.decoder.live():
+             time.sleep(0.002)                    # only reads in flight: poll them
+         first = self.waiting.get() if idle else None                # idle: wait for a request
