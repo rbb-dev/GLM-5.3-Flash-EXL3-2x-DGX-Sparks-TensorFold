@@ -25,6 +25,7 @@ NOTICE asks, this file states what the fork adds.
 | `9014-mgllm-picture-feed` | Pictures run through the vision tower as the prompt's read reaches them, between rounds, one chunk's pictures at a time, and are let go once read | this fork | A failed encode fails that request alone; a picture request can be handed back when the pool is full. Test: `tests/test_9014_picture_feed.py` |
 | `9015-mgllm-picture-records` | Turn records (9004/9005) for picture and clip conversations: each picture's identity is part of the label at its place, and a resume lays out the record's tokens with the request's own pictures | this fork | The same words with another picture never share a record ("pictures differ"). A screenshot loop resumes every turn, past its 8th picture and after a restart too. Test: `tests/test_9015_picture_records.py` |
 | `9016-mgllm-api-info-and-pictures` | The Anthropic Messages route carries TensorFold's info block (token checksum, record path); a Responses `function_call_output` may carry pictures | this fork | Additive fields; such pictures were refused with 400. Test: `tests/test_9016_api_info_and_pictures.py` |
+| `9017-mgllm-spill-keeps` | The spill tier keeps its saved conversations across builds that change only how requests are served; a request's kept state is held from the moment it is kept | this fork | Files that change what a stored state holds still start it empty (`spill.NEUTRAL` lists the ones that do not). Test: `tests/test_9017_spill_keeps.py` |
 
 Each patch file begins with a header that explains it in full, credits included.
 

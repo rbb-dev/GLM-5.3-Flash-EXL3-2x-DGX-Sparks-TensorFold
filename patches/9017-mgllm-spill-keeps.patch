@@ -1,0 +1,113 @@
+# The spill tier keeps what it can. Its identity hashed every source file of the model's family and of tensorfold.cuda,
+# so any build emptied it, one that changed only how requests are served included: every saved conversation was read
+# again after each update. A state is named by its exact token ids, however a request arrived at them, so the files that
+# never change what a stored state holds (request handling, labels and turn records, the stall meter, the collector's
+# schedule, HTTP, tokenizing, stream pacing: spill.NEUTRAL) are left out; every other file, a new one included, is part of
+# the identity as before. And a request's own kept state is held from the moment it is kept, not only once its reply
+# ends: an early write past the high-water mark took a decoding conversation's state to the disk before its record
+# landed, so after a restart that conversation resumed a turn behind; a cancelled reply's state is let go at its finish,
+# a replay's newer state takes over its first's hold, and every other path releases it as before. mgllm, 2026-10-08.
+# Tests: tests/test_9017_spill_keeps.py (CPU).
+
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index f1c8b3a..32bc2e9 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -150,6 +150,31 @@ def preallocate(cfg: SpillConfig | None) -> None:
+     _PINNED["read"] = _pinned(2)
+ 
+ 
++# 9017: source files that never change what a stored state holds (a state is named by its exact token ids, however a
++# request arrived at them): request handling, labels and turn records, the stall meter, the collector's schedule, HTTP,
++# tokenizing, stream pacing. A build that changes only these keeps the tier; every other file of the family and of
++# tensorfold/cuda, a new one included, is part of the identity.
++NEUTRAL = frozenset({
++    "families/glm5_next/cuda/app.py", "families/glm5_next/cuda/labels.py", "families/glm5_next/cuda/turn_records.py",
++    "families/glm5_next/cuda/resume.py", "families/glm5_next/cuda/stall_meter.py",
++    "families/glm5_next/cuda/gc_policy.py", "cuda/http.py", "cuda/server.py", "cuda/unlocked.py", "cuda/health.py",
++    "cuda/scheduler.py", "cuda/streams.py", "cuda/stream_pacing.py", "cuda/reply_text.py"})
++
++
++def sources_digest(pkg, family) -> str:
++    """The sources and kernels of the model's family and of tensorfold.cuda, read (not imported), but ``NEUTRAL``."""
++
++    digest = hashlib.sha256()
++    for base in (family, pkg / "cuda"):
++        for path in sorted(p for p in base.rglob("*") if p.suffix in (".py", ".cu", ".cuh", ".cpp", ".h")):
++            name = path.relative_to(pkg).as_posix()
++            if name in NEUTRAL:
++                continue
++            digest.update(name.encode())
++            digest.update(path.read_bytes())
++    return digest.hexdigest()[:16]
++
++
+ def build_id(model_dir, drafter_dir=None) -> str:
+     """What stored states depend on beyond the cache layout, as MLX's prefix-snapshot key names it: the weights' (and
+     drafter's) paths, the TensorFold version, the sources and kernels of the model's family and of tensorfold.cuda
+@@ -161,12 +186,8 @@ def build_id(model_dir, drafter_dir=None) -> str:
+     from tensorfold import __version__, families
+ 
+     pkg = Path(__file__).resolve().parent.parent
+-    digest = hashlib.sha256()
+     family = pkg.joinpath(*families.detect(model_dir).module.split(".")[1:])
+-    for base in (family, pkg / "cuda"):
+-        for path in sorted(p for p in base.rglob("*") if p.suffix in (".py", ".cu", ".cuh", ".cpp", ".h")):
+-            digest.update(path.relative_to(pkg).as_posix().encode())
+-            digest.update(path.read_bytes())
++    sources = sources_digest(pkg, family)        # 9017
+     run = f"torch={torch.__version__}|cuda={torch.version.cuda}"
+     if torch.cuda.is_available():
+         p = torch.cuda.get_device_properties(torch.cuda.current_device())
+@@ -177,7 +198,7 @@ def build_id(model_dir, drafter_dir=None) -> str:
+     except OSError:
+         pass
+     drafter = f"|drafter={Path(drafter_dir).resolve()}" if drafter_dir is not None else ""
+-    return f"{Path(model_dir).resolve()}{drafter}|tensorfold={__version__}|sources={digest.hexdigest()[:16]}|{run}"
++    return f"{Path(model_dir).resolve()}{drafter}|tensorfold={__version__}|sources={sources}|{run}"
+ 
+ 
+ def weights_id(*dirs) -> str:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 0bbc887..00d7218 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1223,7 +1223,11 @@ class MultiDecoder:
+                 return
+             holder = (getattr(lane.s, "glm", None) or {}).get("turn")
+             if isinstance(holder, dict):
++                old = holder.get("kid")
++                if old is not None and old != snap.kid:
++                    self.record_due.discard(old)     # 9017: a replay's newer state replaces its first
+                 holder["kid"] = snap.kid
++                self.record_due.add(snap.kid)        # 9017: held from now (no early write before its record lands)
+             if lane.inherit is not None:
+                 tail, body, key = lane.inherit
+                 snap._turn_tail, snap.turn, snap.turn_key = list(tail), body, str(key)
+@@ -1263,6 +1267,17 @@ class MultiDecoder:
+         except Exception:                         # noqa: BLE001
+             pass
+ 
++    def _turn_drop(self, lane: Lane) -> None:
++        """``finish``, a cancelled reply: no record comes, so its own kept state is no longer held. Never raises."""
++
++        try:
++            holder = (getattr(lane.s, "glm", None) or {}).get("turn")
++            kid = holder.get("kid") if isinstance(holder, dict) else None
++            if kid is not None:
++                self._turn_release(kid)
++        except Exception:                         # noqa: BLE001
++            pass
++
+     def _turn_held(self, c) -> bool:
+         return c.kid in getattr(self, "record_due", ())
+ 
+@@ -2364,6 +2379,8 @@ class MultiDecoder:
+             self._emit(FINISH, [lane.sid, reason])
+             if reason == DONE:
+                 self._turn_due(lane)
++            else:
++                self._turn_drop(lane)            # 9017: no record comes: the state it held since its keep goes free
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
+             self.decode_due = self.short_round_due = False
