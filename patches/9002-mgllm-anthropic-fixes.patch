@@ -1,0 +1,112 @@
+# Fixes to the Anthropic Messages API on the CUDA server (the recipe's 0084, a backport of upstream TensorFold).
+# /v1/messages/count_tokens answers 400 on a request it cannot prepare (503 at capacity), never a dropped connection
+# (a lone UTF-16 surrogate makes the tokenizer raise TypeError, for one). While a tool call is held, the chat handler's
+# keepalive goes out as Anthropic's own ping, so a client's idle timer never fires on a long call (Claude Code drops an
+# idle stream and sends the request again). A tool_result's pictures stay inside the tool result, in order with its
+# text, as a chat tool message's parts (they went after it, as separate user content). The route reads bodies up to the
+# CUDA chat route's limit (96 MiB, 32 MiB before), so pictures sent as data URLs fit. mgllm, 2026-10-07.
+# Tests: tests/test_9002_stream_and_count.py (CPU).
+
+diff --git tensorfold/server/anthropic.py tensorfold/server/anthropic.py
+index d443807..f21ecdc 100644
+--- tensorfold/server/anthropic.py
++++ tensorfold/server/anthropic.py
+@@ -7,7 +7,7 @@ from typing import Any
+ from tensorfold.server.anthropic_translate import Reply, error, translate
+ from tensorfold.server.errors import CapacityError, RequestError
+ from tensorfold.server.request_body import read_body
+-from tensorfold.server.responses import LIMIT, Wire, _run_chat, _send
++from tensorfold.server.responses import Wire, _run_chat, _send
+ 
+ 
+ def route(path: str) -> bool:
+@@ -49,19 +49,33 @@ def count_tokens(app: Any, chat: dict[str, Any]) -> int:
+                                      reasoning_effort=effort, late_system=app.late_system))
+ 
+ 
++def count_reply(app: Any, chat: dict[str, Any]) -> tuple[int, dict[str, Any]]:
++    """``/v1/messages/count_tokens``: (status, body). A request it cannot prepare is the request's fault: 400, as the
++    chat route answers it, never a dropped connection (9002; a lone UTF-16 surrogate makes the tokenizer raise
++    TypeError, for one)."""
++
++    try:
++        return 200, {"input_tokens": count_tokens(app, chat)}
++    except CapacityError as exc:
++        return 503, error(str(exc), 503)
++    except Exception as exc:                     # noqa: BLE001
++        return 400, error(str(exc) or type(exc).__name__, 400)
++
++
+ def post(handler: Any, app: Any) -> None:
+     from tensorfold.server.http import reply_model
+ 
+     count = handler.path.split("?", 1)[0].rstrip("/").endswith("/count_tokens")
+     try:
+-        raw = read_body(handler, limit=LIMIT)
++        # the CUDA chat route's own limit (96 MiB: up to 50 pictures as data URLs), not the Responses route's 32 MiB
++        raw = read_body(handler, limit=96 * 1024**2)
+         body = json.loads(raw or b"{}")
+         chat = translate(body, count=count)
+         late_system = getattr(app, "late_system", getattr(getattr(app, "template", None), "late_system", "system"))
+         if late_system != "system" and any(m.get("role") == "system" for m in body["messages"]):
+             raise RequestError("the model's chat template does not support mid-conversation system messages")
+         if count:
+-            return _send(handler, 200, {"input_tokens": count_tokens(app, chat)})
++            return _send(handler, *count_reply(app, chat))
+     except (RequestError, ValueError, UnicodeDecodeError) as exc:
+         return _send(handler, 503 if isinstance(exc, CapacityError) else 400,
+                      error(str(exc), 503 if isinstance(exc, CapacityError) else 400))
+diff --git tensorfold/server/anthropic_translate.py tensorfold/server/anthropic_translate.py
+index 2bd0147..bbb85ca 100644
+--- tensorfold/server/anthropic_translate.py
++++ tensorfold/server/anthropic_translate.py
+@@ -81,20 +81,23 @@ def messages(value: Any, system: Any = None) -> list[dict[str, Any]]:
+                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
+             elif kind == "tool_result" and role == "user":
+                 # Tool results precede the following user text, including a batch of parallel results.
+-                texts, images = [], []
++                texts, parts, has_image = [], [], False
+                 for part in _parts(block.get("content", "")):
+                     if part.get("type") == "text":
+-                        texts.append(_string(part.get("text"), "tool_result.text"))
++                        text = _string(part.get("text"), "tool_result.text")
++                        texts.append(text)
++                        parts.append({"type": "text", "text": text})
+                     elif part.get("type") == "image":
+-                        images.append(_image(part))
++                        parts.append(_image(part))
++                        has_image = True
+                     else:
+                         raise RequestError(f"unsupported tool_result content type {part.get('type')!r}")
+                 text = "\n".join(texts)
+                 if block.get("is_error"):
+                     text = "Tool error: " + text
++                    parts.insert(0, {"type": "text", "text": "Tool error: "})
+                 out.append({"role": "tool", "tool_call_id": _string(block.get("tool_use_id"), "tool_use_id", empty=False),
+-                            "content": text})
+-                content.extend(images)
++                            "content": parts if has_image else text})
+             else:
+                 raise RequestError(f"unsupported {role} content block type {kind!r}")
+         if content or calls or thoughts:
+@@ -285,6 +288,11 @@ class Reply:
+                             400 if problem.get("type") == "invalid_request_error" else 500))
+             self.finished = True
+             return
++        # 9002: the chat handler's keepalive while a tool call is held (an empty delta) goes out as Anthropic's own
++        # ``ping``, so a client's idle timer never fires on a long call
++        quiet = (chunk.get("usage") is None and chunk.get("stop_sequence") is None and bool(chunk.get("choices"))
++                 and all(not any((c.get("delta") or {}).values()) and not c.get("finish_reason")
++                         for c in chunk["choices"]))
+         if chunk.get("usage") is not None:
+             self.tokens = usage(chunk["usage"])
+         if chunk.get("stop_sequence") is not None:
+@@ -307,6 +315,8 @@ class Reply:
+                 target["arguments"] += fn.get("arguments") or ""
+ 
+         self.drain_calls()
++        if quiet:
++            self.send({"type": "ping"})
+ 
+     def drain_calls(self, *, final: bool = False) -> None:
+         for at, call in self.calls.items():

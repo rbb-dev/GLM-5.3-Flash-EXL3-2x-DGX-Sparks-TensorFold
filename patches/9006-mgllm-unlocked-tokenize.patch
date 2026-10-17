@@ -1,0 +1,123 @@
+# Prompts tokenized with Python's lock released where the recipe's 0099 does not reach, and 0099's calls made safe for
+# a tokenizer without the batch call. The Rust tokenizer's single-text encode holds the GIL for the whole text, so
+# while a prompt is tokenized no other thread of the engine process runs, the decode loop of every other request
+# included. The recipe's 0099 moved the server's prompts, /tokenize and a picture request's layout to
+# encode_batch_fast; this patch does the same for the two calls it does not cover, through tensorfold/cuda/unlocked.py
+# (encode_batch_fast, encode_batch before tokenizers 0.20): the media markers' template (tensorfold/cuda/markers.py)
+# and 9005's new part of a resumed conversation (resume.py). 0099's two calls (App._encode_ids, GlmVision.prepare) go
+# through the same helper, which asks a tokenizer without a batch call with encode: the same ids from the real
+# tokenizer, and TensorFold's own tests, whose stand-in tokenizers have only encode, run against the tree again.
+# mgllm, 2026-10-08; narrowed to what 0099 does not cover and 0099's calls made safe, 2026-10-10.
+# Tests: tests/test_9006_unlocked_tokenize.py (CPU; needs TF_GLM_TEST_MODEL_DIR).
+
+diff --git tensorfold/cuda/markers.py tensorfold/cuda/markers.py
+index 645ab61..a4bef54 100644
+--- tensorfold/cuda/markers.py
++++ tensorfold/cuda/markers.py
+@@ -6,6 +6,7 @@ from pathlib import Path
+ from typing import Any, Callable, Sequence
+ 
+ import numpy as np
++from tensorfold.cuda.unlocked import encode_ids
+ 
+ MIN_GAP = 256            # a snapshot this close to the prompt start or to the previous snapshot saves too little
+ 
+@@ -22,7 +23,7 @@ class TemplateTokens:
+                             add_generation_prompt: bool = False, **kwargs: Any):
+         text = self.template.template.render(**self.template.specials, messages=messages,
+                                              add_generation_prompt=add_generation_prompt, **kwargs)
+-        return self.tok.encode(text, add_special_tokens=False).ids if tokenize else text
++        return encode_ids(self.tok, text, False) if tokenize else text      # 9006: the GIL released
+ 
+ 
+ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callable[[Sequence[int]], list[int]]:
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 5676dbd..f6988a0 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -29,6 +29,7 @@ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+                                         close_glm_call, hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.stream_pacing import Playout, smooth_streaming
++from tensorfold.cuda.unlocked import encode_ids
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+@@ -291,7 +292,7 @@ class App:
+         and every other stream, for ~0.8 s at each request's start) and skips the character offsets nothing here reads
+         (~30% faster)."""
+ 
+-        return self.tok.encode_batch_fast([text], add_special_tokens=special)[0].ids
++        return encode_ids(self.tok, text, special)      # 9006: encode for a tokenizer without the batch call
+ 
+     def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+         """vLLM's ``/tokenize``: a prompt's ids (``add_special_tokens`` as vLLM, default true), or ``messages``' as the
+diff --git tensorfold/cuda/unlocked.py tensorfold/cuda/unlocked.py
+new file mode 100644
+index 0000000..cdcd8c9
+--- /dev/null
++++ tensorfold/cuda/unlocked.py
+@@ -0,0 +1,21 @@
++"""Patch 9006: tokenize with Python's lock released.
++
++The Rust tokenizer's single-text ``encode`` holds the GIL for the whole text (measured on a GB10 core: 1.75 s for
++996,815 tokens), during which no other thread of the engine process runs, the decode loop of every other request
++included. Its batch calls release the GIL while Rust tokenizes and return the same ids; ``encode_batch_fast`` skips
++the character offsets prompts never use (on a GB10 core as fast as ``encode``; on an x86 workstation twice as fast).
++Only turning the ids into a Python list holds the GIL (about 18 ms at 1M tokens on GB10)."""
++
++from __future__ import annotations
++
++from typing import Any
++
++
++def encode_ids(tok: Any, text: str, add_special_tokens: bool) -> list[int]:
++    """``text``'s token ids, as ``tok.encode(text, add_special_tokens=...).ids`` gives them, without holding the GIL (a
++    tokenizer with no batch call, as the stand-ins in TensorFold's tests are, is asked with ``encode``)."""
++
++    batch = getattr(tok, "encode_batch_fast", None) or getattr(tok, "encode_batch", None)  # _fast: tokenizers 0.20+
++    if batch is None:
++        return tok.encode(text, add_special_tokens=add_special_tokens).ids
++    return batch([text], add_special_tokens=add_special_tokens)[0].ids
+diff --git tensorfold/families/glm5_next/cuda/resume.py tensorfold/families/glm5_next/cuda/resume.py
+index 46e6d89..46ae49f 100644
+--- tensorfold/families/glm5_next/cuda/resume.py
++++ tensorfold/families/glm5_next/cuda/resume.py
+@@ -16,6 +16,7 @@ from typing import Any
+ from tensorfold.cuda.spill_blocks import RECORD
+ 
+ from .turn_records import Turn, View, body_table, body_tail, idvec_digest, parse_key, t_digest
++from tensorfold.cuda.unlocked import encode_ids
+ 
+ ORIGIN_CHARS = 64            # a text turn's visible content that proves it was ours (verify, rows 10-11)
+ 
+@@ -130,7 +131,7 @@ def lookup(multi: Any, tok: Any, v: View) -> View:
+         if t_digest(T) != carrier[3]["t_sha"]:
+             miss("record damaged")
+             continue
+-        suffix = tok.encode(v.render.real[v.render.start_real[j + 1]:], add_special_tokens=False).ids
++        suffix = encode_ids(tok, v.render.real[v.render.start_real[j + 1]:], False)    # 9006: GIL released
+         v.hit, v.hit_turn, v.t_len, v.suffix, v.context, v.reason = carrier[2], j, len(T), len(suffix), T + suffix, ""
+         v.hit_table = table                      # a record of this request's reply keeps these rows (turn_records)
+         return v
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 6f48cb0..0129a65 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -26,6 +26,7 @@ import numpy as np
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ 
+ from .images_http import ImageInputError
++from tensorfold.cuda.unlocked import encode_ids
+ 
+ IMAGE, VIDEO = "<|image|>", "<|video|>"
+ IMAGE_SPAN = "<|begin_of_image|><|image|><|end_of_image|>"     # what the chat template writes for a picture
+@@ -729,7 +730,7 @@ class GlmVision:
+                 rest = rest[v + len(VIDEO_SPAN):]
+         # patch 0099: the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a long
+         # prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
+-        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
++        ids = encode_ids(self.tok, "".join(pieces), False)      # 9006: encode for a tokenizer without the batch call
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "

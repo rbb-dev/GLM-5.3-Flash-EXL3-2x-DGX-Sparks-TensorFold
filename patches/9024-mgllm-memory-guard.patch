@@ -1,0 +1,319 @@
+# The memory guard. A GB10's GPU and CPU share one memory, and nothing watched what the engine left free: on 2026-10-12
+# node2 fell to 471 MB available while serving, from torch's cache of freed GPU blocks (+2.2 GiB in two hours; Python's
+# heap grew 0.34 GiB in 28 hours). Each rank reads its own MemAvailable about once a second on its engine loop: normal
+# from 2.0 GiB, and back to normal only above it; tight below 1.5 GiB: torch's unused cache released and a full Python
+# collection, at most every 30 s; critical below 1.0 GiB: also every saved GPU state dropped on both ranks (the spill
+# tier wrote them when they were kept: they come back on their next turn), at most every 5 s. Admission never stops.
+# While streams are live, rank 0 sends MEMQ about once a second and both ranks all-gather four numbers (level,
+# MemAvailable, torch reserved, torch allocated): /health's memory_guard shows both Sparks, and a critical node2 makes
+# rank 0 drop the states. TF_GLM_MEMORY_GUARD: "0" off, else "normal,tight,critical" in GiB (default 2.0,1.5,1.0).
+# memory_guard.py never changes a stored state (spill.NEUTRAL). mgllm, 2026-10-13.
+# Tests: tests/test_9024_memory_guard.py (CPU).
+
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index d1d2fef..075ad52 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -155,7 +155,7 @@ def preallocate(cfg: SpillConfig | None) -> None:
+ NEUTRAL = frozenset({
+     "families/glm5_next/cuda/app.py", "families/glm5_next/cuda/labels.py", "families/glm5_next/cuda/turn_records.py",
+     "families/glm5_next/cuda/resume.py",
+-    "families/glm5_next/cuda/gc_policy.py", "cuda/http.py", "cuda/server.py", "cuda/unlocked.py", "cuda/health.py",
++    "families/glm5_next/cuda/gc_policy.py", "families/glm5_next/cuda/memory_guard.py", "cuda/http.py", "cuda/server.py", "cuda/unlocked.py", "cuda/health.py",
+     "cuda/scheduler.py", "cuda/streams.py", "cuda/stream_pacing.py", "cuda/reply_text.py"})
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/memory_guard.py tensorfold/families/glm5_next/cuda/memory_guard.py
+new file mode 100644
+index 0000000..2965d96
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/memory_guard.py
+@@ -0,0 +1,131 @@
++"""Patch 9024: the memory guard of a GLM-5.3-Flash rank (``multi.MultiDecoder`` drives it from its loop).
++
++A GB10's GPU and CPU share one memory, and nothing watched what the engine left free: on 2026-10-12 node2 fell to 471
++MB available while serving, from torch's cache of freed GPU blocks (+2.2 GiB in two hours; Python's heap grew 0.34
++GiB in 28 hours). Each rank reads its own MemAvailable about once a second (``sample``) and keeps a level:
++
++- normal from ``normal_at`` (2.0 GiB), and back to normal only above it;
++- tight below ``tight_below`` (1.5 GiB): torch's unused cache released and a full Python collection, between two
++  rounds, at most every ``TIGHT_EVERY`` seconds (releasing the cache on every kept-state drop cost decode 16%, so only
++  under pressure);
++- critical below ``critical_below`` (1.0 GiB): the same, and every saved GPU state dropped on both ranks (written to
++  the spill tier when kept, they come back on their next turn), at most every ``CRITICAL_EVERY`` seconds.
++
++Admission never stops. This module only keeps the levels, limits and counts; the decoder does the actions and tells it
++what each freed (``done``)."""
++
++from __future__ import annotations
++
++import os
++import time
++from typing import Any, Callable
++
++GIB = 1 << 30
++MIB = 1 << 20
++NORMAL, TIGHT, CRITICAL = 0, 1, 2
++LEVELS = ("normal", "tight", "critical")
++POLL_S = 1.0                     # MemAvailable read at most this often
++TIGHT_EVERY = 30.0               # seconds between two tight actions at most
++CRITICAL_EVERY = 5.0             # seconds between two critical actions at most
++DEFAULT = (2.0, 1.5, 1.0)        # GiB: normal from, tight below, critical below
++
++
++def settings(value: str | None = None) -> tuple[int, int, int] | None:
++    """TF_GLM_MEMORY_GUARD: "0" off; else three GiB values, "normal,tight,critical" (default "2.0,1.5,1.0"), each
++    lower than the one before. Bytes, or None when off."""
++
++    raw = (os.environ.get("TF_GLM_MEMORY_GUARD", "") if value is None else value).strip()
++    if raw == "0":
++        return None
++    try:
++        parts = tuple(float(v) for v in raw.split(",")) if raw else DEFAULT
++    except ValueError:
++        parts = ()
++    if len(parts) != 3 or not parts[0] >= parts[1] > parts[2] > 0:
++        raise ValueError(f"TF_GLM_MEMORY_GUARD: 0, or three GiB values normal,tight,critical, falling, not {raw!r}")
++    return tuple(int(v * GIB) for v in parts)                # type: ignore[return-value]
++
++
++def mem_available(path: str = "/proc/meminfo") -> int | None:
++    """This machine's MemAvailable in bytes, or None when it cannot be read."""
++
++    try:
++        with open(path) as fh:
++            for line in fh:
++                if line.startswith("MemAvailable:"):
++                    return int(line.split()[1]) * 1024
++    except (OSError, ValueError, IndexError):
++        return None
++    return None
++
++
++class MemoryGuard:
++    """One rank's level, its action limits and what its actions freed."""
++
++    def __init__(self, levels: tuple[int, int, int] | None = None, *, read: Callable[[], int | None] = mem_available,
++                 clock: Callable[[], float] = time.monotonic) -> None:
++        self.normal_at, self.tight_below, self.critical_below = levels or tuple(int(v * GIB) for v in DEFAULT)
++        self.read, self.clock = read, clock
++        self.level, self.avail, self.read_at = NORMAL, None, None
++        self.last = {"tight": float("-inf"), "critical": float("-inf")}
++        self.actions = {"tight": 0, "critical": 0}
++        self.freed = {"cache_mib": 0.0, "states": 0, "collected": 0}
++        self.last_action: dict[str, Any] = {}
++
++    def sample(self) -> int:
++        """Read MemAvailable now and set the level; returns it. A failed read changes nothing. Never raises."""
++
++        try:
++            a = self.read()
++        except Exception:                                    # noqa: BLE001
++            a = None
++        self.read_at = self.clock()
++        if a is None:
++            return self.level
++        self.avail = int(a)
++        if a < self.critical_below:
++            self.level = CRITICAL
++        elif a < self.tight_below:
++            self.level = TIGHT
++        elif a >= self.normal_at:
++            self.level = NORMAL
++        elif self.level != NORMAL:                           # between tight and normal: not normal again yet
++            self.level = TIGHT
++        return self.level
++
++    def due_sample(self) -> bool:
++        return self.read_at is None or self.clock() - self.read_at >= POLL_S
++
++    def due(self) -> str | None:
++        """The action due now at this level: "critical", "tight" or None (each within its own limit)."""
++
++        now = self.clock()
++        if self.level == CRITICAL and now - self.last["critical"] >= CRITICAL_EVERY:
++            return "critical"
++        if self.level >= TIGHT and now - self.last["tight"] >= TIGHT_EVERY:
++            return "tight"
++        return None
++
++    def done(self, kind: str, freed: dict[str, Any]) -> None:
++        """An action ended: its limit restarts (a critical one also counts as tight's), and what it freed counts."""
++
++        now = self.clock()
++        self.last[kind] = now
++        if kind == "critical":
++            self.last["tight"] = now
++        self.actions[kind] += 1
++        for k in ("cache_mib", "states", "collected"):
++            if freed.get(k):
++                self.freed[k] += freed[k]
++        self.last_action = {"kind": kind, "at_available_mib": (self.avail or 0) // MIB, **freed}
++
++    def status(self, reserved: int = 0, allocated: int = 0) -> list[int]:
++        """[level, MemAvailable MiB, torch reserved MiB, torch allocated MiB]: what MEMQ gathers from each rank."""
++
++        return [self.level, (self.avail or 0) // MIB, int(reserved) // MIB, int(allocated) // MIB]
++
++    def health(self, reserved: int = 0, allocated: int = 0) -> dict[str, Any]:
++        level, avail, res, alloc = self.status(reserved, allocated)
++        return {"level": LEVELS[level], "available_mib": avail, "torch_reserved_mib": res, "torch_allocated_mib": alloc,
++                "levels_gib": [round(v / GIB, 2) for v in (self.normal_at, self.tight_below, self.critical_below)],
++                "actions": dict(self.actions), "freed": dict(self.freed), "last": dict(self.last_action)}
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 1f0c4e9..3cc9726 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -55,14 +55,16 @@ from tensorfold.cuda.streams import Stream, next_fill
+ from . import multi_prefill, shard, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
++from . import memory_guard
+ from .gc_policy import GcPolicy
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, LOADED, \
+-    HAS, LOADPART, UNTWIN, XMOVE = range(1, 20)
++    HAS, LOADPART, UNTWIN, XMOVE, MEMQ = range(1, 21)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+        IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART", LOAD: "LOAD",
+-       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS", LOADPART: "LOADPART", UNTWIN: "UNTWIN", XMOVE: "XMOVE"}
++       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS", LOADPART: "LOADPART", UNTWIN: "UNTWIN", XMOVE: "XMOVE",
++       MEMQ: "MEMQ"}
+ # TF_GLM_SPILL_LOAD_MS (default 40): the most a step of the reads in flight copies between two rounds (rank 0's time)
+ LOAD_MS_DEFAULT = 40.0
+ 
+@@ -731,6 +733,10 @@ class MultiDecoder:
+             self.fill_costs = self._time_prompt_layers()
+         self.gc_policy = GcPolicy()                      # 9010: full collections only when idle (both ranks)
+         self.gc_policy.start()
++        levels = memory_guard.settings()                 # 9024: TF_GLM_MEMORY_GUARD (both ranks alike)
++        self.mem_guard = memory_guard.MemoryGuard(levels) if levels is not None else None
++        self.mem_ranks: dict[int, list[int]] = {}        # 9024: each rank's status at the last MEMQ (rank 0's view)
++        self.mem_ranks_at: float | None = None
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -798,6 +804,7 @@ class MultiDecoder:
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
+                 "prefix_waits": self.prefix_waits, "prefix_wait_tokens": self.prefix_wait_tokens,
++                **({"memory_guard": self._mem_health()} if getattr(self, "mem_guard", None) is not None else {}),
+                 "drafts": {k: {"rounds": c["rounds"], "drafted": list(c["drafted"]), "accepted": list(c["accepted"])}
+                            for k, c in list(self.draft_counts.items())},
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+@@ -1757,6 +1764,89 @@ class MultiDecoder:
+         if size < x.size:
+             self.pool.resize(x, size)
+ 
++    # -- 9024: the memory guard (memory_guard.py) ---------------------------------------------------------------------
++    def _mem_tick(self) -> None:
++        """Both ranks, between iterations, at most once a second: read this Spark's MemAvailable. Rank 0, while streams
++        are live, then has both ranks gather their status (MEMQ, sent now: rank 1 gathers as it applies it). Then the
++        action due, if any. Never the engine's failure: a guard that raises is only a guard that did nothing."""
++
++        g = getattr(self, "mem_guard", None)
++        if g is None or not g.due_sample():
++            return
++        try:
++            g.sample()
++            if self.rank == 0 and self.lanes and self.w.world > 1:
++                self._emit(MEMQ, [])
++                self._flush()
++                self._mem_gather()
++            self._mem_act()
++        except Exception as exc:                 # noqa: BLE001
++            print(f"[tensorfold] memory guard rank {self.rank}: {exc!r}", flush=True)
++
++    def _mem_gather(self) -> None:
++        """Both ranks (MEMQ): every rank's [level, MemAvailable MiB, torch reserved MiB, torch allocated MiB]."""
++
++        g = getattr(self, "mem_guard", None)
++        if g is not None and g.avail is None:
++            g.sample()                  # rank 1's first MEMQ can arrive before its own first sample: read it now, not 0
++        cuda = torch.cuda.is_available()
++        mine = g.status(torch.cuda.memory_reserved() if cuda else 0, torch.cuda.memory_allocated() if cuda else 0) \
++            if g is not None else [0, 0, 0, 0]
++        rows = self.g._gather_ints(mine)
++        self.mem_ranks = {r: [int(v) for v in row] for r, row in enumerate(rows)}
++        self.mem_ranks_at = time.monotonic()
++
++    def _mem_act(self) -> None:
++        """The action due: tight, this Spark's own torch cache released and a full collection; critical, also every
++        saved GPU state dropped on both ranks, which rank 0 decides when any rank is critical (its EVICTs reach rank 1
++        in its next message). Each at most as often as ``memory_guard`` allows; admission never stops."""
++
++        g = self.mem_guard
++        worst = max([g.level] + [row[0] for row in self.mem_ranks.values()]) if self.rank == 0 else g.level
++        drop = self.rank == 0 and worst == memory_guard.CRITICAL and \
++            g.clock() - g.last["critical"] >= memory_guard.CRITICAL_EVERY
++        kind = "critical" if drop else g.due()
++        if kind is None:
++            return
++        freed: dict = {}
++        if drop:
++            states = list(self.kept)
++            for c in states:
++                self._evict(c, spill=False)
++            freed["states"] = len(states)
++        if g.level >= memory_guard.TIGHT:
++            freed.update(self._mem_release())
++        g.done(kind, freed)
++        print(f"[tensorfold] memory guard rank {self.rank}: {kind} at {(g.avail or 0) >> 20} MiB available"
++              f" (worst rank {memory_guard.LEVELS[worst]}): {freed}", flush=True)
++
++    @staticmethod
++    def _mem_release() -> dict:
++        """This Spark: torch's unused cache back to the system, then a full Python collection; what each freed."""
++
++        import gc
++
++        cuda = torch.cuda.is_available()
++        before = torch.cuda.memory_reserved() if cuda else 0
++        t = time.perf_counter()
++        if cuda:
++            torch.cuda.empty_cache()
++        after = torch.cuda.memory_reserved() if cuda else 0
++        n = gc.collect()
++        return {"cache_mib": round((before - after) / memory_guard.MIB, 1), "collected": n,
++                "release_s": round(time.perf_counter() - t, 3)}
++
++    def _mem_health(self) -> dict:
++        """/health (rank 0): this Spark's guard, and every rank's status at the last MEMQ."""
++
++        g = self.mem_guard
++        cuda = torch.cuda.is_available()
++        mine = g.health(torch.cuda.memory_reserved() if cuda else 0, torch.cuda.memory_allocated() if cuda else 0)
++        ranks = {str(r): {"level": memory_guard.LEVELS[row[0]], "available_mib": row[1], "torch_reserved_mib": row[2],
++                          "torch_allocated_mib": row[3]} for r, row in sorted(self.mem_ranks.items())}
++        age = round(time.monotonic() - self.mem_ranks_at, 1) if self.mem_ranks_at is not None else None
++        return {**mine, "ranks": ranks, "ranks_age_s": age}
++
+     def _evict(self, c, spill: bool = True) -> None:
+         """Rank 0: drop a kept prompt on both ranks."""
+ 
+@@ -2550,6 +2640,7 @@ class MultiDecoder:
+         _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
+         self.iteration_since = time.monotonic()           # /health's iteration_s
+         try:
++            self._mem_tick()                     # 9024 (at most once a second)
+             self._pump()
+             return self._iterate()
+         except Exception as exc:
+@@ -3256,6 +3347,7 @@ class MultiDecoder:
+             self.apply(unseal(self.g._share(None, as_array=True), self.received, self.rank))   # 9009
+             self.received = (self.received + 1) % SEAL_MOD
+             self._pump()
++            self._mem_tick()                     # 9024 (at most once a second)
+             _unwatch(self.watchdog)
+             if once:
+                 return
+@@ -3295,6 +3387,8 @@ class MultiDecoder:
+                 from tensorfold.cuda.spill_blocks import ints_key
+ 
+                 self.g._gather_ints([int(self.disk is not None and self.disk.has(ints_key(*p[:3])))])
++            elif op == MEMQ:
++                self._mem_gather()                       # 9024
+             elif op == FLUSH:
+                 self._do_flush(p)
+             elif op == MOVE:

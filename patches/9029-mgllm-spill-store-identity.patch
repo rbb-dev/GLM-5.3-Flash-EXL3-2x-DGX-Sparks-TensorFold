@@ -1,0 +1,49 @@
+# The SSD store survives builds that cannot change a saved state (TODO 4.11). A stored state is named by its exact token
+# ids, so these join NEUTRAL (spill.py; a build changing only NEUTRAL files keeps the store's folder):
+# - what only decides which ids arrive (literal_tokens, chat_template, markers, prompts, turns);
+# - what picks which id comes next (sampling, logprobs);
+# - memory accounting (memory_gate, capacity: a layout they cause is in the store's signature, as plane shapes and grid);
+# - debug modes, off unless set (draft_dump, draft_sim, prof);
+# - the tier's own code (spill.py, spill_blocks.py). tests/test_9029_store_identity.py pins the bytes the block store
+#   writes for one fixed point: a change to them fails there until FORMAT is bumped, which renames the store.
+# Kernels, the forward pass, the drafter, the tensor-parallel split (shares), weight loading (direct_read), the concurrent
+# rounds' tuning (multi_tune) and the engine loop (multi.py) still start a new store. The 2026-10-15 14:01 build emptied
+# the store over tokenizing (0122), parsing (0123) and counters (9024, 9025): this build's install empties it once more,
+# as 9027 and 9028 change multi.py.
+
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index 075ad52..f7c5d12 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -156,7 +156,17 @@ NEUTRAL = frozenset({
+     "families/glm5_next/cuda/app.py", "families/glm5_next/cuda/labels.py", "families/glm5_next/cuda/turn_records.py",
+     "families/glm5_next/cuda/resume.py",
+     "families/glm5_next/cuda/gc_policy.py", "families/glm5_next/cuda/memory_guard.py", "cuda/http.py", "cuda/server.py", "cuda/unlocked.py", "cuda/health.py",
+-    "cuda/scheduler.py", "cuda/streams.py", "cuda/stream_pacing.py", "cuda/reply_text.py"})
++    "cuda/scheduler.py", "cuda/streams.py", "cuda/stream_pacing.py", "cuda/reply_text.py",
++    # 9029 (TODO 4.11): what only decides which ids arrive (tokenizing, templates, resume markers, request order) or
++    # which id comes next (sampling, log probabilities); memory accounting (the gate, the startup estimates: a layout
++    # they cause is in the signature, the planes' shapes and the grid); debug modes, off unless set (draft dumps, the
++    # offline simulator, the profiler); and the tier's own code, whose bytes tests/test_9029_store_identity.py pins:
++    # a change to what it writes for the same input must bump FORMAT (spill_blocks.py; this file's for one-stream
++    # engines), which renames the store
++    "cuda/literal_tokens.py", "cuda/chat_template.py", "cuda/markers.py", "families/glm5_next/prompts.py",
++    "cuda/turns.py", "cuda/sampling.py", "cuda/logprobs.py", "cuda/memory_gate.py", "cuda/capacity.py",
++    "families/glm5_next/cuda/draft_dump.py", "families/glm5_next/cuda/draft_sim.py", "families/glm5_next/cuda/prof.py",
++    "cuda/spill.py", "cuda/spill_blocks.py"})
+ 
+ 
+ def sources_digest(pkg, family) -> str:
+diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
+index d5d540b..af267ec 100644
+--- tensorfold/cuda/spill_blocks.py
++++ tensorfold/cuda/spill_blocks.py
+@@ -80,6 +80,8 @@ import torch
+ from . import spill as _sp
+ 
+ FORMAT = "tensorfold-cuda-spill-blocks-1"
++# 9029: this file is NEUTRAL (spill.NEUTRAL: a build changing it keeps the store), so a change to what it writes for the
++# same input must bump FORMAT, which renames the store; tests/test_9029_store_identity.py pins those bytes
+ READERS = 8                    # blocks read at once on a load (cold NVMe reads scale with the reads in flight)
+ READ_BLOCKS = 16               # TF_GLM_SPILL_READ_BLOCKS: blocks loads read ahead into pinned slots (GLM on two
+                                # Sparks: 12.1 MiB a block; spill.preallocate's read buffers hold the first ten, the rest

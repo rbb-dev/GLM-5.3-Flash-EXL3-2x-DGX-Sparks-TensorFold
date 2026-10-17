@@ -1,0 +1,42 @@
+# /health carries the engine's start time (`started_at`, when this process loaded the family's app, seconds after it
+# started) and `uptime_s`, with turn records on or off. TensorFold reported no start time anywhere, so the board's SINCE
+# BOOT card and the engine's uptime showed a dash (2026-10-16). app.py is NEUTRAL (9017): the SSD store keeps its folder.
+
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 463e0d5..b8cf669 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import dataclasses
+ import os
++import time
+ from collections import Counter
+ from pathlib import Path
+ from typing import Any, Callable
+@@ -15,6 +16,8 @@ from tensorfold.families.glm5_next.cuda import labels, resume, turn_records
+ from tensorfold.families.glm5_next.cuda.turn_records import View
+ from tensorfold.families.glm5_next.prompts import agent_history, effort_tail_enabled, effort_to_tail, thinking_off
+ 
++STARTED = time.time()      # 9026: when this engine process loaded the family's app (seconds after it started)
++
+ 
+ class ThinkingOffTemplate:
+     """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+@@ -252,11 +255,12 @@ class GlmApp(App):
+ 
+     def health_extra(self) -> dict[str, Any]:
+         """9004: turn records on /health: on or off, kept states carrying one, counts (the spill tier counts what it
+-        stored: records_* in its stats)."""
++        stored: records_* in its stats). 9026: the engine's start time and uptime, records on or off."""
+ 
++        up = {"started_at": round(STARTED, 3), "uptime_s": round(time.time() - STARTED, 1)}
+         if self.label_ns is None:
+-            return {}
++            return up
+         multi = getattr(self.engine, "multi", None)
+         kept = list(getattr(multi, "kept", None) or ())
+-        return {"turns": {"on": True, "kept_with_record": sum(1 for c in kept if getattr(c, "turn_key", None)),
+-                          "counts": dict(self.record_counts or {})}}
++        return {**up, "turns": {"on": True, "kept_with_record": sum(1 for c in kept if getattr(c, "turn_key", None)),
++                                "counts": dict(self.record_counts or {})}}

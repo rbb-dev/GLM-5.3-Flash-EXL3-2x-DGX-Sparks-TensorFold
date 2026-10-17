@@ -140,6 +140,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
   dispram ships here: the ranks import the host's client (`python/dispram.py`, GPL-3.0 with a bundling exception)
   mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
+- `0111-glm-chat-continued` (a conversation keeps its id across a rewind or a resume from disk, for patch `0089`'s
+  quota by Thomas Wade; issue #104 by [danielbanu](https://github.com/danielbanu)): by Robert Wojciechowski
+  ([wojo](https://github.com/wojo)).
 - `0098-glm-mmap-uploads` (the drafter's and the vision tower's tensors copied out of the safetensors mmap before
   they go to the GPU: kindling spark-os's 64 KiB-page kernel): by [BadAd84](https://github.com/BadAd84).
 - `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`: the launch order of the expert decode kernel's blocks): by
@@ -164,10 +167,33 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   read, private file modes, a per-Spark weights fingerprint and naming a rank whose settings differ are those of the
   session tier of [JSpark3](https://github.com/jakejharris/jspark3) v2.0.1 by
   [jakejharris](https://github.com/jakejharris). The code is new.
+- `0110-glm-spill-blocks` (the spill tier's block store and the in-flight prefix wait, `SPILL_GIB` with `PARALLEL`
+  above 1, `PREFIX_WAIT`): the block layout (blocks of the pool's alignment named by a hash chained over the ids and
+  salted with the state's lineage), the lineage, writing a state when it is kept through a pinned staging ring between
+  rounds, copying rows still waiting before they are freed or overwritten (`release`), and the fsync order are those
+  of the NVMe KV tier by [BadAd84](https://github.com/BadAd84) in
+  [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) (Apache 2.0), carried
+  over into `tensorfold/cuda/spill_blocks.py`; the rest (lineage forks at each resume point, eviction by conversation
+  and the quota from [issue #122](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/122),
+  reported by [xiepengqi](https://github.com/xiepengqi), the free-disk floor making room in that order, content dedup
+  by hard link, reads on a CUDA stream beside decoding after every rank's HAS, pictures by content keys, and the
+  prefix wait) by Robert Wojciechowski ([wojo](https://github.com/wojo)). It builds on `0088-glm-spill-tier`, whose
+  credits above apply to the tier around it.
 - `0089-glm-kept-state` (a byte budget for the kept states and a per-conversation quota, `TF_GLM_KEPT_BYTES_GIB` and
   `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
   [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased
   onto the current patches, with both limits off by default and their drops kept out of the spill tier, by MiaAI-Lab.
+- `0118-glm-kv-shard` (KV sharding, `TF_GLM_KV_SHARD=1`: each conversation's latent cache stored once, on the Spark
+  that owns it): by Robert Wojciechowski ([wojo](https://github.com/wojo)), in
+  [PR #152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152).
+- `0122-glm-literal-added-tokens` (a quoted added token such as `<think>` or `<tool_call>` in a request stays text): by
+  [ahinore](https://github.com/ahinore), in
+  [PR #164](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/164).
+- `0123-glm-tool-envelope-values` (a literal `</tool_call>` inside a tool argument's value stays in the argument): by
+  [rwl4](https://github.com/rwl4), in
+  [PR #158](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/158).
+- `9001` to `9029` (this fork's patches, listed in `FORK.md`): by [rbb-dev](https://github.com/rbb-dev), developed with
+  [Claude Code](https://claude.com/claude-code).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
@@ -207,6 +233,8 @@ If you believe something here is missing or credited wrongly, please open an iss
 - `0107-glm-decode-indexer` (a decode window's indexer: the scoring in CUDA, the selection in one pass): by
 - `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
 - `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
+- `0119-cuda-budget-parked-pages` (the start-up budget counts the pages parked on the per-CPU free lists): by
+  [wojo](https://github.com/wojo).
 - `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
   `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
 - `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).

@@ -1,0 +1,91 @@
+# The spill tier's refusals on the writer (9023 moved room-making there, after the keep). A state the writer cannot make
+# room for is not written, nor is any waiting state naming one of its unwritten blocks (queued after it, so none of their
+# bytes is written yet): each is counted as no_space, never as a failed write (a later turn that counted on a refused
+# turn's blocks failed as "blocks no longer on disk", after its own blocks were written for nothing). Their reserved bytes
+# are freed at once (they kept other states from fitting until the pump reached the refused one), and a keep naming a
+# refused state's blocks is refused at the keep until the refused jobs are cleaned up. A refused state still pending gets
+# no rows copied when its extent goes (release copied them to the host on the engine's loop); _room returns at once for a
+# job already failed; and an error while making room leaves the state unwritten, counted as a failed write (it was
+# written past the cap and the floor). Found by an agent panel reviewing 9023's port for wojo's #124. mgllm, 2026-10-18.
+# Tests: tests/test_9030_spill_refusal.py (CPU).
+
+diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
+index af267ec..65c2b29 100644
+--- tensorfold/cuda/spill_blocks.py
++++ tensorfold/cuda/spill_blocks.py
+@@ -483,6 +483,7 @@ class BlockStore:
+         self.inflight: set[str] = set()                   # points and blocks queued, not yet complete
+         self.reading: set[str] = set()                    # points being read (never evicted meanwhile)
+         self.pinned: set[str] = set()                     # blocks a persist deciding now counts on (never collected)
++        self.refused: set[str] = set()                    # unwritten blocks of states the writer refused, until cleaned
+         self.parent: dict[str, str | None] = {}           # point -> the longest other point its ids extend
+         self.refs: dict[str, int] = {}                    # block -> points and waiting states naming it
+         self.version = 0                                  # bumped whenever a point comes or goes (the summary's key)
+@@ -864,6 +865,9 @@ class BlockStore:
+     def _persist(self, key, n, ids, obj, extent, lineage, tokens, shared, head, skip, fields, hashes, t0) -> str:
+         with self.lock:
+             new = [(s, e, h) for s, e, h in hashes if h not in self.have and h not in self.inflight]
++            if not self.refused.isdisjoint(h for _, _, h in hashes):     # (9030: counting on a refused state's blocks)
++                self.stats["no_space"] += 1
++                return "no_space"
+         items, layer = _sp.encode(obj, skip=skip)
+         items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
+         small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
+@@ -1015,6 +1019,8 @@ class BlockStore:
+         ``keep`` get the rest of their blocks copied to the host now, queued for the writer."""
+ 
+         for job in self.pending:
++            if job.failed is not None:                      # (refused: never written)
++                job.next = len(job.new)
+             if job.where is not extent or job.point.n <= keep or job.next >= len(job.new):
+                 continue
+             for s, e, h in job.new[job.next:]:
+@@ -1174,6 +1180,8 @@ class BlockStore:
+         the same order. Still short, the state is not written (``no_space``; its writes are skipped). Never raises."""
+ 
+         pt = job.point
++        if job.failed is not None:                          # (refused with another, or its staging failed)
++            return
+         try:
+             if self.quota > 0:
+                 self._trim_own(pt, need)
+@@ -1184,11 +1192,28 @@ class BlockStore:
+                 self._make_room(max(short, over), protect={pt.key})
+                 short = self.floor + need + other - self.disk_free()
+                 if short > 0 or self.stored() + other + need > self.cap:
+-                    self.stats["no_space"] += 1
+-                    job.failed = NoRoom(f"{pt.key}: no room for it on this disk")
+-        except Exception as exc:                            # noqa: BLE001  (then it is written as it would have been)
++                    self._refuse(job)                       # (9030: and every waiting state counting on it)
++        except Exception as exc:                            # noqa: BLE001  (9030: not written, as when persist raised)
++            job.failed = exc
+             print(f"[tensorfold] spill rank {self.rank}: making room for {pt.key} failed: {exc!r}", flush=True)
+ 
++    def _refuse(self, job: Job) -> None:
++        """The writer (9030): no room for ``job``'s state. It is not written, nor is any waiting state naming one of its
++        unwritten blocks (queued after it, so none of their bytes is written yet): each counted as no_space, never as a
++        failed write, and their reserved bytes free at once. A keep naming those blocks meanwhile is refused at the keep
++        (``refused``, until the refused jobs are cleaned up)."""
++
++        with self.lock:
++            gone = {h for _, _, h in job.new} | set(job.cut)
++            for j in [job] + [w for w in self.waiting.values() if w is not job and w.failed is None
++                              and not gone.isdisjoint(w.point.blocks)]:
++                j.failed = NoRoom(f"{j.point.key}: no room for it on this disk")
++                self.stats["no_space"] += 1
++                self.backlog -= j.size
++                j.size = 0
++                self.refused.update(h for _, _, h in j.new)
++                self.refused.update(j.cut)
++
+     def _write_record(self, key: str, rec) -> None:
+         """The writer (9004): written point ``key``'s record: its bytes to ``<key>.rec``, then the point's json again
+         with its label, CRC-32 and size in the fields, each as a point's files are written (a temporary name, fsynced,
+@@ -1302,6 +1327,7 @@ class BlockStore:
+                 self.backlog -= job.size
+                 self.inflight.discard(pt.key)
+                 self.inflight.difference_update([h for _, _, h in job.new] + job.cut)
++                self.refused.difference_update([h for _, _, h in job.new] + job.cut)
+                 self.waiting.pop(pt.key, None)
+                 self._ref(pt.blocks, -1)
+                 self._gc(pt.blocks)

@@ -1,0 +1,78 @@
+# Rank 0's /health lists every rank's SSD store (`spill.ranks`, `spill.ranks_age_s`). Each rank keeps its own store on its
+# own Spark and /health showed rank 0's only: on 2026-10-16 at 01:11, du read node1 27.29 GiB, node2 20.10 GiB, and the
+# board showed one number. The memory guard's all-gather (MEMQ, both ranks) carries each rank's store beside its memory
+# status: stored, written in all and disk free in MiB (the gather is int32), states, blocks, states written. A read that
+# fails sends zeros, so every rank sends the same length and the all-gather cannot wait on a missing rank.
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 95a1877..6d52322 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -67,6 +67,8 @@ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL",
+        MEMQ: "MEMQ"}
+ # TF_GLM_SPILL_LOAD_MS (default 40): the most a step of the reads in flight copies between two rounds (rank 0's time)
+ LOAD_MS_DEFAULT = 40.0
++# 9028: each rank's SSD store on rank 0's /health, as the memory guard's all-gather carries it (int32: sizes in MiB)
++SPILL_RANK_KEYS = ("stored_mib", "written_total_mib", "entries", "blocks", "written", "disk_free_mib")
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -802,7 +804,7 @@ class MultiDecoder:
+                                       key=lambda r: -r[1])[:8],
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+-                **({"spill": self.disk.info()} if self.disk is not None else {}),
++                **({"spill": self._spill_health()} if self.disk is not None else {}),       # 9028
+                 "prefix_waits": self.prefix_waits, "prefix_wait_tokens": self.prefix_wait_tokens,
+                 **({"memory_guard": self._mem_health()} if getattr(self, "mem_guard", None) is not None else {}),
+                 "drafts": {k: {"rounds": c["rounds"], "drafted": list(c["drafted"]), "accepted": list(c["accepted"])}
+@@ -1784,7 +1786,8 @@ class MultiDecoder:
+             print(f"[tensorfold] memory guard rank {self.rank}: {exc!r}", flush=True)
+ 
+     def _mem_gather(self) -> None:
+-        """Both ranks (MEMQ): every rank's [level, MemAvailable MiB, torch reserved MiB, torch allocated MiB]."""
++        """Both ranks (MEMQ): every rank's [level, MemAvailable MiB, torch reserved MiB, torch allocated MiB]; 9028: and
++        its SSD store (``_spill_ints``), for rank 0's /health (each Spark's store is its own)."""
+ 
+         g = getattr(self, "mem_guard", None)
+         if g is not None and g.avail is None:
+@@ -1792,9 +1795,36 @@ class MultiDecoder:
+         cuda = torch.cuda.is_available()
+         mine = g.status(torch.cuda.memory_reserved() if cuda else 0, torch.cuda.memory_allocated() if cuda else 0) \
+             if g is not None else [0, 0, 0, 0]
+-        rows = self.g._gather_ints(mine)
+-        self.mem_ranks = {r: [int(v) for v in row] for r, row in enumerate(rows)}
+-        self.mem_ranks_at = time.monotonic()
++        rows = self.g._gather_ints(list(mine) + self._spill_ints())          # 9028: each rank's SSD store beside it
++        self.mem_ranks = {r: [int(v) for v in row[:4]] for r, row in enumerate(rows)}
++        self.spill_ranks = {r: [int(v) for v in row[4:]] for r, row in enumerate(rows)}
++        self.mem_ranks_at = self.spill_ranks_at = time.monotonic()
++
++    def _spill_ints(self) -> list[int]:
++        """9028: this rank's SSD store for rank 0's /health (``SPILL_RANK_KEYS``), as the memory guard's all-gather
++        carries it: int32, so sizes in MiB. Zeros without a store or when a read fails: every rank must send the same
++        length, or the all-gather waits forever."""
++
++        d = getattr(self, "disk", None)
++        if d is None:
++            return [0] * len(SPILL_RANK_KEYS)
++        try:
++            s = d.stats
++            return [int(d.stored()) >> 20, int(s["written_bytes"] + s["written_small_bytes"]) >> 20, len(d.index),
++                    len(d.have), int(s["written"]), int(d.disk_free()) >> 20]
++        except Exception:                        # noqa: BLE001  (a table changing under the read: send zeros)
++            return [0] * len(SPILL_RANK_KEYS)
++
++    def _spill_health(self) -> dict:
++        """/health (rank 0): this rank's store, and 9028 every rank's at the last memory guard all-gather (``ranks``,
++        sizes in MiB; ``ranks_age_s``: how old that is; none before the first)."""
++
++        info = self.disk.info()
++        ranks = getattr(self, "spill_ranks", None)
++        if ranks:
++            info["ranks"] = {str(r): dict(zip(SPILL_RANK_KEYS, row)) for r, row in ranks.items()}
++            info["ranks_age_s"] = round(time.monotonic() - self.spill_ranks_at, 1)
++        return info
+ 
+     def _mem_act(self) -> None:
+         """The action due: tight, this Spark's own torch cache released and a full collection; critical, also every

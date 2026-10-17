@@ -1,0 +1,68 @@
+# The spill tier keeps what it can. Its identity hashed every source file of the model's family and of tensorfold.cuda,
+# so any build emptied it, one that changed only how requests are served included: every saved conversation was read
+# again after each update. A state is named by its exact token ids, however a request arrived at them, so the files that
+# never change what a stored state holds (request handling, labels and turn records, the collector's schedule, HTTP,
+# tokenizing, stream pacing: spill.NEUTRAL) are left out; every other file, a new one included, is part of the identity
+# as before. The block store (0110) names its folder by the same build id. mgllm, 2026-10-08 (on the spill tier's
+# blocks: 2026-10-13).
+# Tests: tests/test_9017_spill_keeps.py (CPU).
+
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index b76978e..d1d2fef 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -148,6 +148,31 @@ def preallocate(cfg: SpillConfig | None) -> None:
+     _PINNED["read"] = _pinned(2)
+ 
+ 
++# 9017: source files that never change what a stored state holds (a state is named by its exact token ids, however a
++# request arrived at them): request handling, labels and turn records, the collector's schedule, HTTP, tokenizing,
++# stream pacing. A build that changes only these keeps the tier; every other file of the family and of
++# tensorfold/cuda, a new one included, is part of the identity.
++NEUTRAL = frozenset({
++    "families/glm5_next/cuda/app.py", "families/glm5_next/cuda/labels.py", "families/glm5_next/cuda/turn_records.py",
++    "families/glm5_next/cuda/resume.py",
++    "families/glm5_next/cuda/gc_policy.py", "cuda/http.py", "cuda/server.py", "cuda/unlocked.py", "cuda/health.py",
++    "cuda/scheduler.py", "cuda/streams.py", "cuda/stream_pacing.py", "cuda/reply_text.py"})
++
++
++def sources_digest(pkg, family) -> str:
++    """The sources and kernels of the model's family and of tensorfold.cuda, read (not imported), but ``NEUTRAL``."""
++
++    digest = hashlib.sha256()
++    for base in (family, pkg / "cuda"):
++        for path in sorted(p for p in base.rglob("*") if p.suffix in (".py", ".cu", ".cuh", ".cpp", ".h")):
++            name = path.relative_to(pkg).as_posix()
++            if name in NEUTRAL:
++                continue
++            digest.update(name.encode())
++            digest.update(path.read_bytes())
++    return digest.hexdigest()[:16]
++
++
+ def build_id(model_dir, drafter_dir=None) -> str:
+     """What stored states depend on beyond the cache layout, as MLX's prefix-snapshot key names it: the weights' (and
+     drafter's) paths, the TensorFold version, the sources and kernels of the model's family and of tensorfold.cuda
+@@ -159,12 +184,8 @@ def build_id(model_dir, drafter_dir=None) -> str:
+     from tensorfold import __version__, families
+ 
+     pkg = Path(__file__).resolve().parent.parent
+-    digest = hashlib.sha256()
+     family = pkg.joinpath(*families.detect(model_dir).module.split(".")[1:])
+-    for base in (family, pkg / "cuda"):
+-        for path in sorted(p for p in base.rglob("*") if p.suffix in (".py", ".cu", ".cuh", ".cpp", ".h")):
+-            digest.update(path.relative_to(pkg).as_posix().encode())
+-            digest.update(path.read_bytes())
++    sources = sources_digest(pkg, family)        # 9017
+     run = f"torch={torch.__version__}|cuda={torch.version.cuda}"
+     if torch.cuda.is_available():
+         p = torch.cuda.get_device_properties(torch.cuda.current_device())
+@@ -175,7 +196,7 @@ def build_id(model_dir, drafter_dir=None) -> str:
+     except OSError:
+         pass
+     drafter = f"|drafter={Path(drafter_dir).resolve()}" if drafter_dir is not None else ""
+-    return f"{Path(model_dir).resolve()}{drafter}|tensorfold={__version__}|sources={digest.hexdigest()[:16]}|{run}"
++    return f"{Path(model_dir).resolve()}{drafter}|tensorfold={__version__}|sources={sources}|{run}"
+ 
+ 
+ def weights_id(*dirs) -> str:

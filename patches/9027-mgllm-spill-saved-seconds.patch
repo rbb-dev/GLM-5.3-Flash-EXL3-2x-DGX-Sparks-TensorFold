@@ -1,0 +1,158 @@
+# The spill tier counts what its restores saved (`saved_s`, `saved_tokens`, `unpriced`). A restore saves the prefill of
+# the tokens the GPU no longer held: the stored point's length less the longest state the GPU still had, which prestage
+# already finds before it reads the disk past it (`held`, rank 0). Each restore is priced once, when it happens, at the
+# engine's own prefill speed less the restore's load time, so the counter only grows. The speed is /health's: its last
+# 32 finished requests with at least 1,024 uncached tokens (`prefill_price_tps`, the board's real-prompt filter); with
+# none yet, the restore is counted unpriced. The board priced every restored token at one fixed speed, which overstated
+# a restore whose prefix the GPU still held (2026-10-16).
+
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+index 31741fd..d395789 100644
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -13,6 +13,8 @@ STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total
+          "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total",
+          "loop_guard": "loop_guard_total"}     # 9025: the loop guard's fires (TF_GLM_LOOP_GUARD), summed
+ _MADE = threading.Lock()
++REAL_PROMPT = 1024     # 9027: uncached tokens from which a finished request's prefill speed counts (the board's filter)
++PRICE_WINDOW = 32      # 9027: the last this many such requests make the speed restores are priced at
+ 
+ 
+ class Request:
+@@ -38,6 +40,8 @@ class Health:
+         self.live: set[Request] = set()
+         self.totals: dict[str, float] = dict.fromkeys(("requests_total", "prompt_tokens_total",
+                                                        "completion_tokens_total", *STATS.values()), 0)
++        self.prefill: list[tuple[int, float]] = []          # 9027: (uncached tokens, prefill s) of the last real prompts
++        self.prefill_tps: float | None = None
+ 
+     @contextmanager
+     def running(self, prompt: int, out: list[int], arrived: float | None = None):
+@@ -63,6 +67,28 @@ class Health:
+             value = (request.stats or {}).get(key)
+             if isinstance(value, (int, float)) and not isinstance(value, bool):
+                 t[name] += value
++        self._price(request)
++
++    def _price(self, request: Request) -> None:
++        """9027: the engine's own prefill speed over its last ``PRICE_WINDOW`` finished requests with at least
++        ``REAL_PROMPT`` uncached tokens; rank 0's spill tier prices each restore at it, once, when the restore happens."""
++
++        stats = request.stats or {}
++        pre, cached = stats.get("prefill_s"), stats.get("cached", 0)
++        if not isinstance(pre, (int, float)) or isinstance(pre, bool) or pre <= 0:
++            return
++        if not isinstance(cached, (int, float)) or isinstance(cached, bool):
++            cached = 0
++        uncached = request.prompt - cached
++        if uncached < REAL_PROMPT:
++            return
++        self.prefill.append((int(uncached), float(pre)))
++        del self.prefill[:-PRICE_WINDOW]
++        self.prefill_tps = sum(u for u, _ in self.prefill) / sum(s for _, s in self.prefill)
++        engine = getattr(getattr(self, "app", None), "engine", None)
++        disk = getattr(getattr(getattr(engine, "scheduler", None), "decoder", None), "disk", None)
++        if disk is not None and hasattr(disk, "price_tps"):
++            disk.price_tps = self.prefill_tps
+ 
+     def _metrics(self, request: Request) -> None:
+         stats = request.stats or {}
+@@ -85,6 +111,8 @@ class Health:
+             body: dict[str, Any] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in self.totals.items()}
+             body["completion_tokens_total"] += sum(len(r.out) for r in self.live)
+             running = len(self.live)
++            if self.prefill_tps is not None:            # 9027: the speed restores are priced at now
++                body["prefill_price_tps"] = round(self.prefill_tps, 1)
+         body = {"ok": True, "backend": "tensorfold", "busy": running > 0, "requests_running": running, **body}
+         scheduler = getattr(getattr(app, "engine", None), "scheduler", None)     # /health answers whatever the app
+         decoder = getattr(scheduler, "decoder", None)
+diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
+index b5347c1..d5d540b 100644
+--- tensorfold/cuda/spill_blocks.py
++++ tensorfold/cuda/spill_blocks.py
+@@ -432,6 +432,7 @@ class LoadJob:
+         self.stage = None
+         self.t0 = time.perf_counter()
+         self.record: Any = None                             # 9004: (label, bytes) of the point's record, read beside it
++        self.held = 0                                       # 9027: tokens the GPU still held of it (multi.prestage)
+ 
+ 
+ class BlockStore:
+@@ -496,8 +497,11 @@ class BlockStore:
+             "pruned_shared", "quota_trims", "loaded", "loaded_tokens", "loaded_bytes", "load_failed", "crc_failed",
+             "load_unfit", "staged_blocks", "released_blocks", "unwritten_evicted", "dropped", "trimmed_turns",
+             "written_small_bytes", "disk_lookups", "disk_hits", "has_refused",
+-            "records_written", "records_unstored", "records_refused", "records_failed", "records_bad")}
+-        self.stats.update(write_s=0.0, load_s=0.0, keep_s=0.0, pump_s=0.0, load_small_s=0.0, room_s=0.0)
++            "records_written", "records_unstored", "records_refused", "records_failed", "records_bad",
++            "saved_tokens", "unpriced")}                  # 9027
++        self.stats.update(write_s=0.0, load_s=0.0, keep_s=0.0, pump_s=0.0, load_small_s=0.0, room_s=0.0, saved_s=0.0)
++        # 9027: the engine's own prefill speed (rank 0's /health sets it: cuda/health.py), each restore priced at it
++        self.price_tps: float | None = None
+         self.unwritten_by: dict[str, int] = {}
+         self.restore_ms: list[float] = []
+         self.direct = bool(getattr(cfg, "direct", True)) and hasattr(os, "O_DIRECT")
+@@ -1520,13 +1524,15 @@ class BlockStore:
+                 return pt
+         return None
+ 
+-    def load_async(self, key: str, where) -> LoadJob:
++    def load_async(self, key: str, where, held: int = 0) -> LoadJob:
+         """Start reading point ``key``'s blocks and small state on the reader thread; the engine copies them into extent
+-        ``where`` (``step``, ``finish_load``). A point this rank lacks fails the read."""
++        ``where`` (``step``, ``finish_load``). A point this rank lacks fails the read. 9027: ``held``, the tokens of it
++        the GPU still held (the restore saves the prefill of the rest)."""
+ 
+         with self.lock:
+             pt = self.index.get(key)
+         lj = LoadJob(pt, where)
++        lj.held = max(0, int(held))
+         if pt is None:
+             lj.error = FileNotFoundError(f"rank {self.rank} has no stored prompt {key}")
+             lj.done.set()
+@@ -1823,6 +1829,15 @@ class BlockStore:
+         self.stats["loaded"] += 1
+         self.stats["loaded_tokens"] += lj.point.n
+         self.stats["load_s"] += dt
++        # 9027: what the restore saved, priced once, now: the prefill of the tokens the GPU no longer held at the engine's
++        # own prefill speed, less this load's time (the board priced every restored token at one fixed speed)
++        gain = max(0, lj.point.n - lj.held)
++        self.stats["saved_tokens"] += gain
++        tps = self.price_tps
++        if tps:
++            self.stats["saved_s"] += max(0.0, gain / tps - dt)
++        else:
++            self.stats["unpriced"] += 1
+         self.restore_ms.append(dt * 1000.0)
+         if len(self.restore_ms) > 4096:
+             del self.restore_ms[:2048]
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 3cc9726..95a1877 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -2100,12 +2100,13 @@ class MultiDecoder:
+         self.disk.stats["disk_hits"] += 1
+         self._emit(LOAD, [hi, lo, n, base, size, lid])
+         self._flush()
+-        h = self._start_load(hi, lo, n, base, size, lid)
++        h = self._start_load(hi, lo, n, base, size, lid, held=len(hit.ids) if hit is not None else 0)   # 9027
+         h.ids = [int(t) for t in pt.ids]
+         return h
+ 
+-    def _start_load(self, hi: int, lo: int, n: int, base: int, size: int, lid: int):
+-        """Both ranks: an extent at ``base`` for stored prompt (hi, lo), its read started on the reader thread."""
++    def _start_load(self, hi: int, lo: int, n: int, base: int, size: int, lid: int, held: int = 0):
++        """Both ranks: an extent at ``base`` for stored prompt (hi, lo), its read started on the reader thread. 9027:
++        ``held``, rank 0's: the tokens of it the GPU still held (the restore is priced on rank 0 only)."""
+ 
+         import types
+ 
+@@ -2118,7 +2119,7 @@ class MultiDecoder:
+ 
+         h.key = ints_key(hi, lo, n)
+         try:
+-            h.lj = self.disk.load_async(h.key, x)
++            h.lj = self.disk.load_async(h.key, x, held=held)
+         except Exception as exc:                 # noqa: BLE001  (the read fails at LOADED, on every rank)
+             h.err = exc
+         self.loads[lid] = h

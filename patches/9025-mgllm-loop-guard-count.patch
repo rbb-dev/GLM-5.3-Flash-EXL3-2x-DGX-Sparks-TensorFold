@@ -1,0 +1,19 @@
+# /health counts the loop guard's fires (`loop_guard_total`). TF_GLM_LOOP_GUARD closes a think block stuck repeating
+# itself and counts the fires per reply (`stats["loop_guard"]`, cuda/server.py), but nothing kept the count: a loop it
+# closed left no trace anywhere (Boris 2026-10-14, "Hmm" loops). The count is folded with the other finished-request
+# stats, so the board and sparkDash can show it.
+
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+index a0c834f..31741fd 100644
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -10,7 +10,8 @@ from typing import Any
+ from tensorfold.server import metrics
+ 
+ STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total", "cached": "cached_tokens_total",
+-         "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total"}
++         "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total",
++         "loop_guard": "loop_guard_total"}     # 9025: the loop guard's fires (TF_GLM_LOOP_GUARD), summed
+ _MADE = threading.Lock()
+ 
+ 

@@ -1,0 +1,151 @@
+# The spill tier's bookkeeping off the engine loop. A kept state made its own room on the engine's loop as it was kept
+# (patch 0110's persist): its conversation's quota (its own old turns and forks past its share of the cap, _trim_own) and
+# the cap's or the free-disk floor's shortfall (_make_room), each walking every stored state, and the quota every block
+# name of every stored point, while every stream waited. Room grows with the store: at 768 GiB a Spark it holds about
+# twelve times the states of the 64 GiB the tier was measured at. Now the keep only checks counters (a state the disk
+# cannot hold whatever goes is still refused there, at once); when room or a quota is wanted, the writer makes it before
+# the state's first byte is written, in the same eviction order (a job queued ahead of the state's rows: the writer
+# takes its jobs in order). Still short then, the state is not written: counted as no_space, its blocks never staged.
+# A conversation's bytes for its quota are counted from its own points against the blocks' reference counts, which
+# count every stored point and waiting state naming a block: exactly what walking every block name gave, for the
+# points' own blocks only. /health's room_s: the writer's time making room. mgllm, 2026-10-13.
+# Tests: tests/test_9023_spill_bookkeeping.py (CPU), and the recipe's tools/spill_blocks_check.py (73 checks, all pass).
+
+diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
+index 6cee924..b5347c1 100644
+--- tensorfold/cuda/spill_blocks.py
++++ tensorfold/cuda/spill_blocks.py
+@@ -57,6 +57,7 @@ decoding after every rank's HAS (copied between rounds, as #118 does), and pictu
+ 
+ from __future__ import annotations
+ 
++import collections
+ import concurrent.futures
+ import contextlib
+ import errno
+@@ -240,6 +241,10 @@ def _span_bytes(planes, s: int, e: int) -> int:
+     return out
+ 
+ 
++class NoRoom(OSError):
++    """9023: the writer could not make room for a state (``BlockStore._room``): it is not written."""
++
++
+ class Corrupt(Exception):
+     """A file that does not match its point (a CRC-32, a size): the read fails, the point goes."""
+ 
+@@ -492,7 +497,7 @@ class BlockStore:
+             "load_unfit", "staged_blocks", "released_blocks", "unwritten_evicted", "dropped", "trimmed_turns",
+             "written_small_bytes", "disk_lookups", "disk_hits", "has_refused",
+             "records_written", "records_unstored", "records_refused", "records_failed", "records_bad")}
+-        self.stats.update(write_s=0.0, load_s=0.0, keep_s=0.0, pump_s=0.0, load_small_s=0.0)
++        self.stats.update(write_s=0.0, load_s=0.0, keep_s=0.0, pump_s=0.0, load_small_s=0.0, room_s=0.0)
+         self.unwritten_by: dict[str, int] = {}
+         self.restore_ms: list[float] = []
+         self.direct = bool(getattr(cfg, "direct", True)) and hasattr(os, "O_DIRECT")
+@@ -861,19 +866,12 @@ class BlockStore:
+         pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
+                    [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
+                    fields)
+-        if self.quota > 0:
+-            self._trim_own(pt, need)
+         short = self.floor + need + self.backlog - self.disk_free()
+         over = self.stored() + self.backlog + need - self.cap
+         if max(short, over) > self.stored():                # (the disk is full of other things): nothing to evict for
+             self.stats["no_space"] += 1
+             return "no_space"
+-        if short > 0 or over > 0:
+-            self._make_room(max(short, over), protect={key})
+-            short = self.floor + need + self.backlog - self.disk_free()
+-            if short > 0 or self.stored() + self.backlog + need > self.cap:
+-                self.stats["no_space"] += 1
+-                return "no_space"
++        room = self.quota > 0 or short > 0 or over > 0      # 9023: made by the writer (``_room``), not on this loop
+         # the block the state's end cuts (a tail): its last pooled-key row is still filling, and the stream goes on
+         # writing it in place, so its rows are copied to the host now, as they are at the keep (at most one block)
+         cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in new[-1:] if e - s < self.block]
+@@ -889,6 +887,8 @@ class BlockStore:
+             job.cut = [h for h, _ in cut]
+             self.waiting[key] = job
+             self._ref(pt.blocks, 1)
++        if room:                                            # 9023: before any of its bytes (the writer is in order)
++            self.jobs.put(("room", job, None, need))
+         for h, data in cut:                                 # (written before the blocks the pumps stage)
+             self.jobs.put(("rows", job, h, data))
+         self.pending.append(job)
+@@ -939,6 +939,8 @@ class BlockStore:
+         limit = 1 << 62 if limit is None else limit
+         while self.pending:
+             job = self.pending[0]
++            if job.failed is not None:                      # (refused by the writer, 9023: nothing to stage)
++                job.next = len(job.new)
+             while job.next < len(job.new):
+                 if limit <= 0:
+                     self.stats["pump_s"] += time.perf_counter() - t0
+@@ -1117,6 +1119,10 @@ class BlockStore:
+             if kind == "record":
+                 self._write_record(h, item)                 # (9004; never raises)
+                 continue
++            if kind == "room":
++                self._room(job, item)                       # (9023; never raises)
++                self.stats["room_s"] += time.perf_counter() - t0
++                continue
+             if kind == "rows":
+                 try:
+                     if job.failed is None:
+@@ -1155,6 +1161,28 @@ class BlockStore:
+             except OSError:
+                 pass
+ 
++    def _room(self, job: Job, need: int) -> None:
++        """The writer (9023), before any byte of ``job``'s state: the room ``persist`` used to make on the engine's loop
++        as the state was kept, walking every stored state while every stream waited: its conversation's own old turns
++        and forks past its quota (``_trim_own``), then the cap's or the free-disk floor's shortfall (``_make_room``), in
++        the same order. Still short, the state is not written (``no_space``; its writes are skipped). Never raises."""
++
++        pt = job.point
++        try:
++            if self.quota > 0:
++                self._trim_own(pt, need)
++            other = self.backlog - job.size                 # (what else waits, as persist counted it)
++            short = self.floor + need + other - self.disk_free()
++            over = self.stored() + other + need - self.cap
++            if short > 0 or over > 0:
++                self._make_room(max(short, over), protect={pt.key})
++                short = self.floor + need + other - self.disk_free()
++                if short > 0 or self.stored() + other + need > self.cap:
++                    self.stats["no_space"] += 1
++                    job.failed = NoRoom(f"{pt.key}: no room for it on this disk")
++        except Exception as exc:                            # noqa: BLE001  (then it is written as it would have been)
++            print(f"[tensorfold] spill rank {self.rank}: making room for {pt.key} failed: {exc!r}", flush=True)
++
+     def _write_record(self, key: str, rec) -> None:
+         """The writer (9004): written point ``key``'s record: its bytes to ``<key>.rec``, then the point's json again
+         with its label, CRC-32 and size in the fields, each as a point's files are written (a temporary name, fsynced,
+@@ -1259,8 +1287,9 @@ class BlockStore:
+                 if pt.shared and not shared:
+                     self.jobs.put(("shared", None, pt.key, None))
+         except Exception as exc:                            # noqa: BLE001  (only this state is not kept on disk)
+-            self.stats["write_failed"] += 1
+-            print(f"[tensorfold] spill rank {self.rank}: writing {pt.key} failed: {exc!r}", flush=True)
++            if not isinstance(exc, NoRoom):                 # (9023: refused for room, counted as no_space)
++                self.stats["write_failed"] += 1
++                print(f"[tensorfold] spill rank {self.rank}: writing {pt.key} failed: {exc!r}", flush=True)
+         finally:
+             job.small = None
+             with self.lock:
+@@ -1435,8 +1464,12 @@ class BlockStore:
+         """Lock held: bytes only ``keys``' points hold (their files, and blocks no other point names)."""
+ 
+         mine = set(keys)
+-        others = {b for k, pt in self.index.items() if k not in mine for b in pt.blocks}
+-        blocks = {b for k in mine for b in self.index[k].blocks if b not in others and b in self.have}
++        # 9023: a block only these points name is one named by them as many times as every stored point names it
++        # (``refs`` counts the stored points and the waiting states naming it; a point names a block once), so only
++        # these points' blocks are walked, never every block name in the store
++        named = collections.Counter(b for k in mine for b in self.index[k].blocks)
++        waiting = collections.Counter(b for j in self.waiting.values() for b in j.point.blocks)
++        blocks = {b for b, c in named.items() if b in self.have and c == self.refs.get(b, 0) - waiting.get(b, 0)}
+         inos = {self.have[b][1] for b in blocks}
+         own = sum(self.inodes[i][0] for i in inos if i in self.inodes and self.inodes[i][1] <= blocks)
+         return own + sum(self.index[k].small_bytes for k in mine)
